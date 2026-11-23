@@ -192,7 +192,7 @@ def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, Inli
 
     text = (
         f"<b>{title}</b>\n\n"
-        f"🕒 Waktu sekarang: <code>{now.strftime('%Y-%m-%d %H:%M %Z')}</code>\n\n"
+        f"🕒 Waktu realtime: <code>{now.strftime('%Y-%m-%d %H:%M:%S %Z')}</code>\n\n"
         "Pilih tombol cepat atau <b>ketik waktu bebas</b> dengan format apa saja:\n"
         "• <b>Tanggal &amp; jam:</b> <code>2026-11-23 15:30</code> atau <code>23/11/2026 15:30</code>\n"
         "• <b>Jam saja:</b> <code>15:30</code> atau <code>besok 08:00</code>\n"
@@ -366,10 +366,10 @@ def format_admins_menu(config: BotConfig, extra_admins: set[int]) -> tuple[str, 
 def format_main_menu_text(update: Update, config: BotConfig, active_count: int) -> str:
     chat = update.effective_chat
     chat_id = chat.id if chat else "N/A"
-    now_str = datetime.now(config.tzinfo).strftime("%Y-%m-%d %H:%M %Z")
+    now_str = datetime.now(config.tzinfo).strftime("%Y-%m-%d %H:%M:%S %Z")
     return (
         "<b>🤖 Menu Utama — Telegram AutoSender</b>\n\n"
-        f"🕒 Waktu server: <code>{now_str}</code>\n"
+        f"🕒 Waktu realtime: <code>{now_str}</code>\n"
         f"🆔 Chat ID ini: <code>{chat_id}</code>\n"
         f"📅 Jadwal aktif: <b>{active_count}</b>\n\n"
         "Pilih menu di bawah ini:"

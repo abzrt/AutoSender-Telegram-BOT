@@ -255,7 +255,7 @@ class BotConfig:
     """Konfigurasi utama bot dari environment variables."""
 
     bot_token: str
-    timezone: str = "Asia/Jakarta"
+    timezone: str = "Asia/Makassar"
     admin_ids: set[int] = field(default_factory=set)
     schedules_file: Path = Path("schedules.json")
     admins_file: Path | None = None
@@ -284,7 +284,7 @@ def load_config(env_path: str | Path | None = None, require_token: bool = True) 
             "BOT_TOKEN belum diatur. Salin .env.example menjadi .env lalu isi BOT_TOKEN dari @BotFather."
         )
 
-    timezone = os.getenv("TIMEZONE", "Asia/Jakarta").strip() or "Asia/Jakarta"
+    timezone = os.getenv("TIMEZONE", "Asia/Makassar").strip() or "Asia/Makassar"
     ZoneInfo(timezone)
 
     raw_admins = os.getenv("ADMIN_IDS", "").strip()
