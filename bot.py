@@ -247,6 +247,8 @@ def format_targets_menu(known_groups: dict[str, dict[str, str]]) -> tuple[str, I
             InlineKeyboardButton("➕ 📌 Lainnya", callback_data="tgtadd:other"),
         ],
     ]
+    if known_groups:
+        buttons.append([InlineKeyboardButton("🔄 Refresh Nama Grup/Target", callback_data="tgtrefresh")])
 
     for cid_str, info in sorted(known_groups.items(), key=lambda kv: kv[1].get("title", "").lower()):
         icon = target_type_icon(info.get("type", "other"))
@@ -338,6 +340,61 @@ def forget_group(bot_data: dict[str, Any], chat_id: int | str) -> None:
     groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
     if groups.pop(str(chat_id), None) is not None:
         save_known_groups(config.resolved_groups_file, groups)
+
+
+def extract_chat_title(chat_obj: Any) -> str:
+    """Ambil nama terbaik dari objek Chat Telegram."""
+    title = getattr(chat_obj, "title", None)
+    if title:
+        return str(title)
+    full_name = getattr(chat_obj, "full_name", None)
+    if full_name:
+        return str(full_name)
+    first_name = getattr(chat_obj, "first_name", None)
+    last_name = getattr(chat_obj, "last_name", None)
+    combined = " ".join(p for p in [first_name, last_name] if p).strip()
+    if combined:
+        return combined
+    username = getattr(chat_obj, "username", None)
+    if username:
+        return f"@{username}"
+    return str(getattr(chat_obj, "id", ""))
+
+
+async def resolve_chat_target(
+    bot: Bot,
+    target_id: int | str,
+    default_type: str = "other",
+) -> tuple[int | str, str, str, bool]:
+    """Resolve nama asli & ID final dari Telegram (mendukung migrasi supergroup & fallback -100).
+
+    Mengembalikan (resolved_id, resolved_title, resolved_type, fetched_ok).
+    """
+    candidates: list[int | str] = [target_id]
+    if isinstance(target_id, int):
+        s_id = str(target_id)
+        if default_type in ("group", "channel") and not s_id.startswith("-100"):
+            candidates.append(int(f"-100{abs(target_id)}"))
+        elif target_id < 0 and not s_id.startswith("-100"):
+            candidates.append(int(f"-100{abs(target_id)}"))
+
+    for cand in candidates:
+        try:
+            chat_obj = await bot.get_chat(cand)
+            resolved_type = getattr(chat_obj, "type", None) or default_type
+            return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True
+        except ChatMigrated as migrated:
+            try:
+                chat_obj = await bot.get_chat(migrated.new_chat_id)
+                resolved_type = getattr(chat_obj, "type", None) or "supergroup"
+                return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True
+            except TelegramError:
+                return migrated.new_chat_id, str(migrated.new_chat_id), "supergroup", False
+        except TelegramError as exc:
+            logger.info("get_chat(%s) gagal: %s", cand, exc)
+            continue
+
+    return target_id, str(target_id), default_type, False
 
 
 async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -981,12 +1038,20 @@ async def wiz_target_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return ASK_TARGET
 
     try:
-        chat_ids = parse_chat_ids(update.message.text)
+        raw_chat_ids = parse_chat_ids(update.message.text)
     except ValueError as exc:
         await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
         return ASK_TARGET
 
-    context.user_data["wiz"] = {"chat_ids": chat_ids}
+    resolved_ids: list[int | str] = []
+    for cid in raw_chat_ids:
+        default_type = "channel" if isinstance(cid, str) else ("group" if cid < 0 else "user")
+        final_id, title, rtype, fetched_ok = await resolve_chat_target(context.bot, cid, default_type)
+        resolved_ids.append(final_id)
+        if fetched_ok or (isinstance(final_id, int) and final_id < 0):
+            remember_group(context.bot_data, final_id, title, rtype)
+
+    context.user_data["wiz"] = {"chat_ids": resolved_ids}
     config: BotConfig = context.bot_data["config"]
     text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await update.message.reply_html(text, reply_markup=keyboard)
@@ -1410,12 +1475,20 @@ async def edit_save_target_text(update: Update, context: ContextTypes.DEFAULT_TY
         return EDIT_NEW_TARGET
 
     try:
-        chat_ids = parse_chat_ids(update.message.text)
+        raw_chat_ids = parse_chat_ids(update.message.text)
     except ValueError as exc:
         await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
         return EDIT_NEW_TARGET
 
-    return await _apply_edited_target(update, context, chat_ids)
+    resolved_ids: list[int | str] = []
+    for cid in raw_chat_ids:
+        default_type = "channel" if isinstance(cid, str) else ("group" if cid < 0 else "user")
+        final_id, title, rtype, fetched_ok = await resolve_chat_target(context.bot, cid, default_type)
+        resolved_ids.append(final_id)
+        if fetched_ok or (isinstance(final_id, int) and final_id < 0):
+            remember_group(context.bot_data, final_id, title, rtype)
+
+    return await _apply_edited_target(update, context, resolved_ids)
 
 
 async def edit_ask_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1700,24 +1773,24 @@ async def target_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return TARGET_ADD_INPUT
 
     target_type = str(context.user_data.pop("target_add_type", "other"))
-    resolved_title = custom_label
+    final_id, auto_title, auto_type, fetched_ok = await resolve_chat_target(context.bot, target_id, target_type)
+    resolved_title = custom_label or auto_title
+    resolved_type = auto_type if (fetched_ok and target_type == "other") else (auto_type if fetched_ok else target_type)
 
-    if not resolved_title:
-        try:
-            chat_obj = await context.bot.get_chat(target_id)
-            resolved_title = chat_obj.title or chat_obj.full_name or chat_obj.username or str(target_id)
-            if target_type == "other" and chat_obj.type:
-                target_type = chat_obj.type
-        except TelegramError:
-            resolved_title = str(target_id)
-
-    remember_group(context.bot_data, target_id, resolved_title, target_type)
+    remember_group(context.bot_data, final_id, resolved_title, resolved_type)
     known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
     text, markup = format_targets_menu(known_groups)
 
+    note = ""
+    if not custom_label and not fetched_ok:
+        note = (
+            "\n⚠️ <i>Nama asli belum terbaca oleh Telegram (pastikan bot sudah masuk ke grup/channel "
+            "atau user sudah pernah klik /start, lalu tekan 🔄 Refresh Nama).</i>"
+        )
+
     await update.message.reply_html(
-        f"<b>✅ Target tersimpan!</b> {target_type_icon(target_type)} "
-        f"<b>{html.escape(resolved_title)}</b> (<code>{html.escape(str(target_id))}</code>)\n\n{text}",
+        f"<b>✅ Target tersimpan!</b> {target_type_icon(resolved_type)} "
+        f"<b>{html.escape(resolved_title)}</b> (<code>{html.escape(str(final_id))}</code>){note}\n\n{text}",
         reply_markup=markup,
     )
     return ConversationHandler.END
@@ -1807,6 +1880,30 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
         text, markup = format_targets_menu(known_groups)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "tgtrefresh":
+        known_groups = dict(context.bot_data.get("known_groups", {}))
+        updated_count = 0
+        for cid_str, info in list(known_groups.items()):
+            parsed_id = parse_single_target_id(cid_str)
+            final_id, title, rtype, fetched_ok = await resolve_chat_target(
+                context.bot,
+                parsed_id,
+                info.get("type", "other"),
+            )
+            if fetched_ok:
+                if str(final_id) != cid_str:
+                    forget_group(context.bot_data, cid_str)
+                remember_group(context.bot_data, final_id, title, rtype)
+                updated_count += 1
+        refreshed = context.bot_data.get("known_groups", {})
+        text, markup = format_targets_menu(refreshed)
+        await query.edit_message_text(
+            f"🔄 Refresh selesai! <b>{updated_count}</b> nama target berhasil diperbarui dari Telegram.\n\n{text}",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
         return
 
     if data.startswith("tgtdel:"):
@@ -2120,7 +2217,7 @@ def main() -> None:
             CallbackQueryHandler(wiz_cancel, pattern=r"^wiz:cancel$"),
             CommandHandler("cancel", wiz_cancel),
             CommandHandler(["start", "help", "menu"], wiz_fallback_menu),
-            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:|tgtdel:)"),
+            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:|tgtdel:|tgtrefresh)"),
         ],
         allow_reentry=True,
         per_message=False,
