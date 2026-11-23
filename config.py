@@ -254,10 +254,17 @@ class BotConfig:
     timezone: str = "Asia/Jakarta"
     admin_ids: set[int] = field(default_factory=set)
     schedules_file: Path = Path("schedules.json")
+    admins_file: Path | None = None
 
     @property
     def tzinfo(self) -> ZoneInfo:
         return ZoneInfo(self.timezone)
+
+    @property
+    def resolved_admins_file(self) -> Path:
+        if self.admins_file is not None:
+            return self.admins_file
+        return self.schedules_file.parent / "admins.json"
 
 
 def load_config(env_path: str | Path | None = None, require_token: bool = True) -> BotConfig:
@@ -362,3 +369,44 @@ def ensure_schedules_file(path: str | Path, seed_path: str | Path | None = None)
     else:
         file_path.write_text("[]\n", encoding="utf-8")
     return file_path
+
+
+def load_extra_admins(path: str | Path) -> set[int]:
+    """Muat daftar User ID admin tambahan dari admins.json."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return set()
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {int(x) for x in data if isinstance(x, int) or (isinstance(x, str) and x.strip().lstrip("-").isdigit())}
+
+
+def save_extra_admins(path: str | Path, admin_ids: set[int]) -> None:
+    """Simpan daftar User ID admin tambahan ke admins.json."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    sorted_ids = sorted(admin_ids)
+    file_path.write_text(json.dumps(sorted_ids, indent=2) + "\n", encoding="utf-8")
+
+
+def parse_user_ids(raw: str) -> list[int]:
+    """Parse daftar User ID Telegram (angka positif dipisah koma)."""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("User ID tidak boleh kosong.")
+    result: list[int] = []
+    for part in parts:
+        try:
+            uid = int(part)
+            if uid <= 0:
+                raise ValueError
+            result.append(uid)
+        except ValueError as exc:
+            raise ValueError(
+                f"User ID '{part}' tidak valid. Masukkan angka User ID Telegram (contoh: 217411824)."
+            ) from exc
+    return result

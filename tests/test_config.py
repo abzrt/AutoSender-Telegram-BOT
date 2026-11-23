@@ -9,7 +9,37 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from bot import build_custom_menu_keyboard, build_main_menu_keyboard, build_trigger, parse_chat_ids
+from bot import (
+    build_custom_menu_keyboard,
+    build_main_menu_keyboard,
+    build_trigger,
+    get_all_admin_ids,
+    parse_chat_ids,
+)
+from config import (
+    BotConfig,
+    ScheduleJob,
+    load_config,
+    load_extra_admins,
+    load_schedules,
+    parse_flexible_schedule,
+    parse_user_ids,
+    save_extra_admins,
+    save_schedules,
+)
+
+
+def test_admin_persistence_and_parsing(tmp_path: Path) -> None:
+    admins_file = tmp_path / "admins.json"
+    save_extra_admins(admins_file, {111, 222})
+    assert load_extra_admins(admins_file) == {111, 222}
+
+    cfg = BotConfig(bot_token="x", admin_ids={217411824}, schedules_file=tmp_path / "schedules.json")
+    assert get_all_admin_ids(cfg, {"extra_admins": {111}}) == {217411824, 111}
+
+    assert parse_user_ids("217411824, 123456") == [217411824, 123456]
+    with pytest.raises(ValueError, match="tidak valid"):
+        parse_user_ids("-100123")
 
 
 def test_parse_chat_ids() -> None:
@@ -33,6 +63,7 @@ def test_main_and_custom_menu_keyboards() -> None:
     main_callbacks = [btn.callback_data for row in build_main_menu_keyboard().inline_keyboard for btn in row]
     assert "menu:custom" in main_callbacks
     assert "menu:list" in main_callbacks
+    assert "menu:admins" in main_callbacks
     assert "menu:chatid" in main_callbacks
     assert "menu:reload" in main_callbacks
 

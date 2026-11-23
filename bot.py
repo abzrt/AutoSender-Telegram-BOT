@@ -41,9 +41,12 @@ from config import (
     ScheduleJob,
     ensure_schedules_file,
     load_config,
+    load_extra_admins,
     load_schedules,
     parse_flexible_schedule,
     parse_run_at,
+    parse_user_ids,
+    save_extra_admins,
     save_schedules,
 )
 
@@ -54,7 +57,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-autosender")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# State untuk ConversationHandler Custom Menu
+# State untuk ConversationHandler Custom Menu & Manajemen Admin
 (
     ASK_TARGET,
     ASK_DATETIME,
@@ -65,7 +68,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
     EDIT_NEW_MESSAGE,
     EDIT_NEW_TIME,
     EDIT_NEW_TARGET,
-) = range(9)
+    ADMIN_ADD_ID,
+) = range(10)
 
 
 def parse_chat_ids(raw: str) -> list[int | str]:
@@ -144,9 +148,12 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
-                InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
+                InlineKeyboardButton("👑 Kelola Admin", callback_data="menu:admins"),
             ],
-            [InlineKeyboardButton("🔄 Reload schedules.json", callback_data="menu:reload")],
+            [
+                InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
+                InlineKeyboardButton("🔄 Reload", callback_data="menu:reload"),
+            ],
         ]
     )
 
@@ -288,12 +295,67 @@ def register_jobs(
     return active_count
 
 
-def is_admin(update: Update, config: BotConfig) -> bool:
-    """Cek apakah pengirim adalah admin (jika ADMIN_IDS kosong, semua diizinkan)."""
-    if not config.admin_ids:
+def get_all_admin_ids(config: BotConfig, bot_data: dict[str, Any] | None = None) -> set[int]:
+    """Gabungkan Owner (ADMIN_IDS dari env) + admin tambahan dari admins.json."""
+    extra: set[int] = set()
+    if bot_data is not None:
+        extra = set(bot_data.get("extra_admins", set()))
+    return set(config.admin_ids) | extra
+
+
+def is_admin(update: Update, config: BotConfig, bot_data: dict[str, Any] | None = None) -> bool:
+    """Cek apakah pengirim adalah admin (jika belum ada admin sama sekali, semua diizinkan)."""
+    all_admins = get_all_admin_ids(config, bot_data)
+    if not all_admins:
         return True
     user = update.effective_user
-    return bool(user and user.id in config.admin_ids)
+    return bool(user and user.id in all_admins)
+
+
+async def deny_access(update: Update) -> None:
+    """Kirim pesan penolakan akses untuk non-admin beserta User ID-nya."""
+    user = update.effective_user
+    uid = user.id if user else "N/A"
+    msg = (
+        "⛔ <b>Akses ditolak.</b>\n"
+        "Bot ini hanya dapat digunakan oleh admin terdaftar.\n\n"
+        f"User ID kamu: <code>{uid}</code>"
+    )
+    if update.callback_query:
+        await update.callback_query.answer("Akses ditolak (khusus admin).", show_alert=True)
+    elif update.message:
+        await update.message.reply_html(msg)
+
+
+def format_admins_menu(config: BotConfig, extra_admins: set[int]) -> tuple[str, InlineKeyboardMarkup]:
+    """Susun tampilan menu Kelola Admin."""
+    lines = ["<b>👑 Kelola Admin Bot</b>\n"]
+    if config.admin_ids:
+        lines.append("<b>Owner (dari ADMIN_IDS):</b>")
+        for uid in sorted(config.admin_ids):
+            lines.append(f"• 👑 <code>{uid}</code> <i>(permanen)</i>")
+    else:
+        lines.append("⚠️ <i>ADMIN_IDS di env masih kosong.</i>")
+
+    lines.append("")
+    if extra_admins:
+        lines.append("<b>Admin Tambahan:</b>")
+        for uid in sorted(extra_admins):
+            lines.append(f"• 👤 <code>{uid}</code>")
+    else:
+        lines.append("<i>Belum ada admin tambahan.</i>")
+
+    if not config.admin_ids and not extra_admins:
+        lines.append("\n⚠️ <b>Mode Terbuka:</b> Tambahkan minimal 1 admin agar bot terkunci hanya untuk admin!")
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("➕ Tambah Admin (User ID)", callback_data="admin:add")]
+    ]
+    for uid in sorted(extra_admins):
+        if uid not in config.admin_ids:
+            buttons.append([InlineKeyboardButton(f"🗑️ Hapus Admin {uid}", callback_data=f"admin:del:{uid}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
 def format_main_menu_text(update: Update, config: BotConfig, active_count: int) -> str:
@@ -415,13 +477,32 @@ async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
     text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
     await update.message.reply_html(text, reply_markup=build_main_menu_keyboard())
 
 
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    extra_admins: set[int] = context.bot_data.get("extra_admins", set())
+    text, markup = format_admins_menu(config, extra_admins)
+    await update.message.reply_html(text, reply_markup=markup)
+
+
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
     user = update.effective_user
     user_id = user.id if user else "N/A"
@@ -438,8 +519,8 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message or not update.effective_chat:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     raw_text = update.message.text or ""
@@ -484,8 +565,8 @@ async def cmd_setpesan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     raw_text = update.message.text or ""
@@ -528,8 +609,8 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     if not context.args:
@@ -558,8 +639,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
@@ -571,8 +652,8 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     if not context.args:
@@ -598,8 +679,8 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message:
         return
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await update.message.reply_text("Maaf, perintah ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return
 
     try:
@@ -628,8 +709,8 @@ async def wiz_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await query.answer()
 
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await query.edit_message_text("Maaf, fitur ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return ConversationHandler.END
 
     chat = update.effective_chat
@@ -807,8 +888,8 @@ async def edit_list_jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
 
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await query.edit_message_text("Maaf, fitur ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return ConversationHandler.END
 
     jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
@@ -848,8 +929,8 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.answer()
 
     config: BotConfig = context.bot_data["config"]
-    if not is_admin(update, config):
-        await query.edit_message_text("Maaf, fitur ini khusus admin.")
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
         return ConversationHandler.END
 
     target_id = query.data.split(":", 1)[1]
@@ -1142,19 +1223,95 @@ async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 # ==================== CALLBACK MENU UMUM ====================
 
 
+async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+    await query.answer()
+
+    await query.edit_message_text(
+        "<b>➕ Tambah Admin Baru</b>\n\n"
+        "Ketik <b>User ID Telegram</b> orang yang ingin diberi akses bot "
+        "(boleh lebih dari satu dipisah koma, contoh: <code>123456789, 987654321</code>).\n\n"
+        "<i>Tips: Suruh orang tersebut klik Start di bot — bot akan menampilkan User ID mereka di pesan akses ditolak.</i>",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    return ADMIN_ADD_ID
+
+
+async def admin_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return ADMIN_ADD_ID
+
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+
+    try:
+        new_ids = parse_user_ids(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return ADMIN_ADD_ID
+
+    extra_admins: set[int] = set(context.bot_data.get("extra_admins", set()))
+    extra_admins.update(new_ids)
+    save_extra_admins(config.resolved_admins_file, extra_admins)
+    context.bot_data["extra_admins"] = extra_admins
+
+    text, markup = format_admins_menu(config, extra_admins)
+    await update.message.reply_html(
+        f"<b>✅ Berhasil menambahkan admin:</b> <code>{new_ids}</code>\n\n{text}",
+        reply_markup=markup,
+    )
+    return ConversationHandler.END
+
+
 async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query or not query.data:
         return
-    await query.answer()
 
     config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+
+    await query.answer()
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
     data = query.data
 
     if data == "menu:home":
         text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
+        return
+
+    if data == "menu:admins":
+        extra_admins: set[int] = context.bot_data.get("extra_admins", set())
+        text, markup = format_admins_menu(config, extra_admins)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("admin:del:"):
+        uid = int(data.split(":", 2)[2])
+        if uid in config.admin_ids:
+            await query.answer("Owner dari ADMIN_IDS tidak bisa dihapus.", show_alert=True)
+            return
+        extra_admins = set(context.bot_data.get("extra_admins", set()))
+        extra_admins.discard(uid)
+        save_extra_admins(config.resolved_admins_file, extra_admins)
+        context.bot_data["extra_admins"] = extra_admins
+        text, markup = format_admins_menu(config, extra_admins)
+        await query.edit_message_text(
+            f"🗑️ Admin <code>{uid}</code> dihapus.\n\n{text}",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
         return
 
     if data == "menu:custom":
@@ -1178,10 +1335,6 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML",
             reply_markup=build_back_menu_keyboard(),
         )
-        return
-
-    if not is_admin(update, config):
-        await query.edit_message_text("Maaf, menu ini khusus admin.")
         return
 
     if data == "menu:list":
@@ -1250,16 +1403,19 @@ async def post_init(application: Application) -> None:
     config: BotConfig = application.bot_data["config"]
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
+    extra_admins = load_extra_admins(config.resolved_admins_file)
     scheduler = AsyncIOScheduler(timezone=config.tzinfo)
     register_jobs(scheduler, application.bot, jobs, config)
     scheduler.start()
 
     application.bot_data["scheduler"] = scheduler
     application.bot_data["jobs"] = jobs
+    application.bot_data["extra_admins"] = extra_admins
 
     await application.bot.set_my_commands(
         [
             BotCommand("menu", "Buka menu utama interaktif"),
+            BotCommand("admin", "Kelola daftar admin bot"),
             BotCommand("schedule", "Buat jadwal pesan cepat"),
             BotCommand("setpesan", "Ubah custom pesan jadwal"),
             BotCommand("list", "Lihat daftar jadwal aktif"),
@@ -1268,7 +1424,12 @@ async def post_init(application: Application) -> None:
             BotCommand("cancel", "Batalkan proses saat ini"),
         ]
     )
-    logger.info("Bot siap, menu perintah terdaftar, dan scheduler berjalan (timezone=%s).", config.timezone)
+    all_admins = get_all_admin_ids(config, application.bot_data)
+    logger.info(
+        "Bot siap, menu perintah terdaftar, admin=%s, scheduler berjalan (timezone=%s).",
+        sorted(all_admins) if all_admins else "TERBUKA",
+        config.timezone,
+    )
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1339,6 +1500,7 @@ def main() -> None:
             CallbackQueryHandler(wiz_new_start, pattern=r"^custom:new$"),
             CallbackQueryHandler(edit_list_jobs, pattern=r"^custom:edit$"),
             CallbackQueryHandler(edit_show_actions, pattern=r"^editpick:.+$"),
+            CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"),
         ],
         states={
             ASK_TARGET: [
@@ -1374,6 +1536,9 @@ def main() -> None:
                 CallbackQueryHandler(edit_save_target_button, pattern=r"^edittarget:-?\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_target_text),
             ],
+            ADMIN_ADD_ID: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_save),
+            ],
         },
         fallbacks=[
             CallbackQueryHandler(wiz_cancel, pattern=r"^wiz:cancel$"),
@@ -1384,6 +1549,7 @@ def main() -> None:
 
     application.add_handler(wizard_handler)
     application.add_handler(CommandHandler(["start", "help", "menu"], cmd_menu))
+    application.add_handler(CommandHandler(["admin", "admins"], cmd_admins))
     application.add_handler(CommandHandler("chatid", cmd_chatid))
     application.add_handler(CommandHandler(["schedule", "jadwalkan"], cmd_schedule))
     application.add_handler(CommandHandler("setpesan", cmd_setpesan))
