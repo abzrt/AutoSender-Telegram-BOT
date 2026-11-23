@@ -1,0 +1,10 @@
+# Lindungi file konfigurasi, jadwal, state, dan log agar tidak bisa dibuka dari browser
+<FilesMatch "^(config\.php|schedules\.json|state\.json|autosender\.log)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

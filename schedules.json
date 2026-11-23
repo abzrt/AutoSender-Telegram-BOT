@@ -1,0 +1,53 @@
+[
+  {
+    "id": "pengingat_berkala",
+    "name": "Pengingat Setiap 60 Menit",
+    "enabled": false,
+    "trigger": "interval",
+    "minutes": 60,
+    "chat_ids": [
+      217411824
+    ],
+    "parse_mode": "HTML",
+    "message": "JANGAN LUPA CLOSE TIKET"
+  },
+  {
+    "id": "custom_20261123_1025",
+    "name": "Custom (2026-11-23 10:30:43 WIB)",
+    "enabled": true,
+    "trigger": "date",
+    "run_at": "2026-11-23 10:32:41",
+    "chat_ids": [
+      -1001759084680,
+      -1001503456534,
+      -1003754253118,
+      -4617486371
+    ],
+    "parse_mode": "HTML",
+    "message": "NASIR ANJING"
+  },
+  {
+    "id": "custom_20261123_1053",
+    "name": "Custom (Setiap 1 menit)",
+    "enabled": true,
+    "trigger": "interval",
+    "minutes": 1,
+    "chat_ids": [
+      -4042906266
+    ],
+    "parse_mode": "HTML",
+    "message": "MENCOKKKKK"
+  },
+  {
+    "id": "custom_20261123_1054",
+    "name": "Custom (Setiap 1 menit)",
+    "enabled": true,
+    "trigger": "interval",
+    "minutes": 1,
+    "chat_ids": [
+      -4042906266
+    ],
+    "parse_mode": "HTML",
+    "message": "B 171 MU"
+  }
+]

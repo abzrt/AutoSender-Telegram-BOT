@@ -1,0 +1,10 @@
+services:
+  telegram-autosender:
+    build: .
+    container_name: telegram-autosender
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Mount schedules.json agar bisa diedit tanpa rebuild (cukup /reload di Telegram)
+      - ./schedules.json:/app/schedules.json:ro

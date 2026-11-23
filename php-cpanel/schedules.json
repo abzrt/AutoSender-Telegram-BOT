@@ -1,0 +1,26 @@
+[
+  {
+    "id": "sapaan_pagi",
+    "name": "Sapaan Pagi Harian",
+    "enabled": true,
+    "trigger": "cron",
+    "cron": "0 8 * * *",
+    "chat_ids": [
+      -1001234567890
+    ],
+    "parse_mode": "HTML",
+    "message": "Selamat pagi semuanya! ☀️\nJangan lupa cek agenda hari ini ya."
+  },
+  {
+    "id": "pengingat_berkala",
+    "name": "Pengingat Setiap 60 Menit",
+    "enabled": false,
+    "trigger": "interval",
+    "minutes": 60,
+    "chat_ids": [
+      -1001234567890
+    ],
+    "parse_mode": "HTML",
+    "message": "<b>Pengingat Berkala:</b>\nSudah minum air putih jam ini? 💧"
+  }
+]

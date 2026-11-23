@@ -1,0 +1,13 @@
+# Rahasia & environment lokal (JANGAN pernah di-commit!)
+.env
+php-cpanel/config.php
+php-cpanel/state.json
+php-cpanel/autosender.log
+
+# Virtual environment & cache Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+Thumbs.db
