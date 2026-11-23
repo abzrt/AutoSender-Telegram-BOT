@@ -24,7 +24,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Bot, BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import ChatMigrated, TelegramError
+from telegram.error import BadRequest, ChatMigrated, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -42,6 +42,7 @@ from config import (
     ScheduleJob,
     append_delivery_history,
     ensure_schedules_file,
+    extract_mention_user_ids,
     format_active_window,
     is_within_active_window,
     load_config,
@@ -342,13 +343,18 @@ def remember_group(
     chat_id: int | str,
     title: str,
     chat_type: str = "group",
+    username: str | None = None,
 ) -> None:
     """Simpan atau perbarui target (grup/user/channel/lainnya) ke groups.json."""
     config: BotConfig = bot_data["config"]
     groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
     key = str(chat_id)
-    new_entry = {"title": title or f"Target {chat_id}", "type": chat_type}
-    if groups.get(key) != new_entry:
+    prev = groups.get(key) or {}
+    new_entry: dict[str, str] = {"title": title or f"Target {chat_id}", "type": chat_type}
+    resolved_uname = (username if username is not None else prev.get("username", "") or "").lstrip("@").strip()
+    if resolved_uname:
+        new_entry["username"] = resolved_uname
+    if prev != new_entry:
         groups[key] = new_entry
         save_known_groups(config.resolved_groups_file, groups)
 
@@ -425,9 +431,13 @@ async def collect_mention_candidates(
         if ttype not in ("user", "private"):
             continue
         title = (info.get("title") or cid_str).replace(":", " ").strip()
+        saved_uname = (info.get("username") or "").lstrip("@").strip()
         if cid_str.startswith("@"):
             token = cid_str
             label = f"{title} ({cid_str})" if title.lower() != cid_str.lower() else cid_str
+        elif saved_uname:
+            token = f"@{saved_uname}"
+            label = f"{title} (@{saved_uname})"
         else:
             token = f"{title}:{cid_str}"
             label = title
@@ -586,14 +596,15 @@ def extract_chat_title(chat_obj: Any) -> str:
     return str(getattr(chat_obj, "id", ""))
 
 
-async def resolve_chat_target(
+async def resolve_chat_target_details(
     bot: Bot,
     target_id: int | str,
     default_type: str = "other",
-) -> tuple[int | str, str, str, bool]:
-    """Resolve nama asli & ID final dari Telegram (mendukung migrasi supergroup & fallback -100).
+    known_groups: dict[str, dict[str, str]] | None = None,
+) -> tuple[int | str, str, str, bool, str | None]:
+    """Resolve nama asli, tipe, & username dari Telegram (mendukung migrasi supergroup, fallback -100, & get_chat_member).
 
-    Mengembalikan (resolved_id, resolved_title, resolved_type, fetched_ok).
+    Mengembalikan (resolved_id, resolved_title, resolved_type, fetched_ok, username).
     """
     candidates: list[int | str] = [target_id]
     if isinstance(target_id, int):
@@ -607,19 +618,50 @@ async def resolve_chat_target(
         try:
             chat_obj = await bot.get_chat(cand)
             resolved_type = getattr(chat_obj, "type", None) or default_type
-            return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True
+            uname = getattr(chat_obj, "username", None)
+            return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True, uname
         except ChatMigrated as migrated:
             try:
                 chat_obj = await bot.get_chat(migrated.new_chat_id)
                 resolved_type = getattr(chat_obj, "type", None) or "supergroup"
-                return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True
+                uname = getattr(chat_obj, "username", None)
+                return chat_obj.id, extract_chat_title(chat_obj), str(resolved_type), True, uname
             except TelegramError:
-                return migrated.new_chat_id, str(migrated.new_chat_id), "supergroup", False
+                return migrated.new_chat_id, str(migrated.new_chat_id), "supergroup", False, None
         except TelegramError as exc:
             logger.info("get_chat(%s) gagal: %s", cand, exc)
             continue
 
-    return target_id, str(target_id), default_type, False
+    # Fallback untuk user numerik yang belum pernah /start bot: cari di grup yang dikenal bot
+    if isinstance(target_id, int) and target_id > 0 and known_groups:
+        for gid_str, info in known_groups.items():
+            gtype = (info.get("type") or "").lower()
+            if gtype not in ("group", "supergroup"):
+                continue
+            try:
+                gid = int(gid_str)
+            except ValueError:
+                continue
+            try:
+                member = await bot.get_chat_member(gid, target_id)
+                user_obj = getattr(member, "user", None)
+                if user_obj:
+                    uname = getattr(user_obj, "username", None)
+                    return target_id, extract_chat_title(user_obj), "user", True, uname
+            except TelegramError:
+                continue
+
+    return target_id, str(target_id), default_type, False, None
+
+
+async def resolve_chat_target(
+    bot: Bot,
+    target_id: int | str,
+    default_type: str = "other",
+) -> tuple[int | str, str, str, bool]:
+    """Resolve nama asli & ID final dari Telegram (kompatibel dengan signature lama)."""
+    final_id, title, rtype, fetched_ok, _ = await resolve_chat_target_details(bot, target_id, default_type)
+    return final_id, title, rtype, fetched_ok
 
 
 async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -656,6 +698,21 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
+
+    # Pasif perbarui @username jika pengirim sudah tersimpan di Kelola Target (tanpa menambah user baru)
+    user = update.effective_user
+    if user and not getattr(user, "is_bot", False) and getattr(user, "username", None):
+        uid_str = str(user.id)
+        known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+        if uid_str in known_groups:
+            info = known_groups[uid_str]
+            remember_group(
+                context.bot_data,
+                uid_str,
+                info.get("title") or extract_chat_title(user),
+                info.get("type", "user"),
+                username=user.username,
+            )
 
 
 def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -695,6 +752,66 @@ def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, Inli
     return text, keyboard
 
 
+async def resolve_mention_usernames_for_chat(
+    bot: Bot,
+    chat_id: int | str,
+    user_ids: list[str],
+    saved_targets: dict[str, dict[str, str]] | None = None,
+    config: BotConfig | None = None,
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve @username Telegram untuk setiap User ID numerik di grup target via get_chat_member.
+
+    Jika user memiliki @username di Telegram, otomatis upgrade ke @username agar mention
+    100% aktif (biru, bisa diklik, dan mengirim notifikasi) walaupun user belum pernah /start bot.
+    """
+    uid_usernames: dict[str, str] = {}
+    warnings: list[str] = []
+    targets_updated = False
+
+    for uid_str in user_ids:
+        if saved_targets and uid_str in saved_targets:
+            cached_uname = (saved_targets[uid_str].get("username") or "").lstrip("@").strip()
+            if cached_uname:
+                uid_usernames[uid_str] = cached_uname
+
+        if not uid_str.isdigit():
+            continue
+        uid_int = int(uid_str)
+
+        resolved_user: Any = None
+        if isinstance(chat_id, int) and chat_id < 0:
+            try:
+                member = await bot.get_chat_member(chat_id, uid_int)
+                resolved_user = getattr(member, "user", None)
+                status = getattr(member, "status", "")
+                if status in (ChatMember.LEFT, ChatMember.BANNED):
+                    warnings.append(f"User ID {uid_str} bukan anggota aktif grup {chat_id} (status: {status}).")
+            except TelegramError as exc:
+                logger.info("get_chat_member(%s, %s) gagal: %s", chat_id, uid_int, exc)
+                if uid_str not in uid_usernames:
+                    warnings.append(f"User ID {uid_str} tidak ditemukan di grup {chat_id}.")
+
+        if resolved_user is None and uid_str not in uid_usernames:
+            try:
+                resolved_user = await bot.get_chat(uid_int)
+            except TelegramError:
+                pass
+
+        raw_uname = getattr(resolved_user, "username", None) if resolved_user else None
+        uname = raw_uname.lstrip("@").strip() if isinstance(raw_uname, str) else ""
+        if uname:
+            uid_usernames[uid_str] = uname
+            if saved_targets is not None and uid_str in saved_targets:
+                if saved_targets[uid_str].get("username") != uname:
+                    saved_targets[uid_str]["username"] = uname
+                    targets_updated = True
+
+    if targets_updated and config is not None and saved_targets is not None:
+        save_known_groups(config.resolved_groups_file, saved_targets)
+
+    return uid_usernames, warnings
+
+
 async def send_scheduled_message(
     bot: Bot,
     job: ScheduleJob,
@@ -702,6 +819,7 @@ async def send_scheduled_message(
     tag_presets: dict[str, list[str]] | None = None,
     config: BotConfig | None = None,
     ignore_window: bool = False,
+    diagnostics: list[str] | None = None,
 ) -> tuple[int, int]:
     """Kirim pesan dari satu ScheduleJob ke semua chat_ids."""
     now = datetime.now(config.tzinfo) if config else datetime.now()
@@ -715,42 +833,85 @@ async def send_scheduled_message(
 
     success = 0
     failed = 0
-    final_text = render_message_with_mentions(
+    numeric_uids = extract_mention_user_ids(
         job.message,
-        job.mentions,
-        job.parse_mode,
+        mentions=job.mentions,
         saved_targets=saved_targets,
         tag_presets=tag_presets,
     )
 
     for chat_id in job.chat_ids:
         err_msg: str | None = None
+        uid_usernames: dict[str, str] = {}
+        chat_warnings: list[str] = []
+        if numeric_uids:
+            uid_usernames, chat_warnings = await resolve_mention_usernames_for_chat(
+                bot,
+                chat_id,
+                numeric_uids,
+                saved_targets=saved_targets,
+                config=config,
+            )
+            if chat_warnings:
+                for w in chat_warnings:
+                    logger.warning("Mention warning [%s]: %s", job.id, w)
+                if diagnostics is not None:
+                    diagnostics.extend(chat_warnings)
+
+        final_text = render_message_with_mentions(
+            job.message,
+            job.mentions,
+            job.parse_mode,
+            saved_targets=saved_targets,
+            tag_presets=tag_presets,
+            uid_usernames=uid_usernames,
+        )
+
         try:
+            sent_msg: Any = None
             if job.photo:
                 photo_path = Path(job.photo)
                 if photo_path.exists() and photo_path.is_file():
                     with photo_path.open("rb") as photo_file:
-                        await bot.send_photo(
+                        sent_msg = await bot.send_photo(
                             chat_id=chat_id,
                             photo=photo_file,
                             caption=final_text or None,
                             parse_mode=job.parse_mode,
                         )
                 else:
-                    await bot.send_photo(
+                    sent_msg = await bot.send_photo(
                         chat_id=chat_id,
                         photo=job.photo,
                         caption=final_text or None,
                         parse_mode=job.parse_mode,
                     )
             else:
-                await bot.send_message(
+                sent_msg = await bot.send_message(
                     chat_id=chat_id,
                     text=final_text,
                     parse_mode=job.parse_mode,
                 )
             success += 1
             logger.info("Job '%s' terkirim ke chat_id=%s", job.id, chat_id)
+
+            # Cek apakah Telegram me-strip sebagian tg://user?id= (biasanya karena user tanpa @username & privasi/belum /start)
+            remaining_id_links = len(
+                [uid for uid in numeric_uids if uid not in uid_usernames]
+            )
+            if remaining_id_links > 0 and sent_msg is not None:
+                raw_entities = getattr(sent_msg, "caption_entities", None) if job.photo else getattr(sent_msg, "entities", None)
+                if isinstance(raw_entities, (list, tuple)):
+                    active_text_mentions = sum(1 for e in raw_entities if getattr(e, "type", "") == "text_mention")
+                    if active_text_mentions < remaining_id_links:
+                        stripped = remaining_id_links - active_text_mentions
+                        warn_msg = (
+                            f"{stripped} user tanpa @username tidak ter-mention oleh Telegram "
+                            "(minta user tersebut pasang @username Telegram atau klik /start ke bot)."
+                        )
+                        logger.warning("Mention stripped [%s -> %s]: %s", job.id, chat_id, warn_msg)
+                        if diagnostics is not None and warn_msg not in diagnostics:
+                            diagnostics.append(warn_msg)
         except TelegramError as exc:
             failed += 1
             err_msg = str(exc)
@@ -1195,7 +1356,14 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     save_schedules(config.schedules_file, remaining)
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, remaining, config)
+    register_jobs(
+        scheduler,
+        context.bot,
+        remaining,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = remaining
 
     await update.message.reply_html(
@@ -1237,6 +1405,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_html(f"🚀 Mengirim tes untuk job <code>{matched.id}</code>...")
+    diag: list[str] = []
     success, failed = await send_scheduled_message(
         context.bot,
         matched,
@@ -1244,9 +1413,14 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.bot_data.get("tag_presets"),
         config,
         ignore_window=True,
+        diagnostics=diag,
     )
+    diag_text = ""
+    if diag:
+        diag_lines = "\n".join(f"• {html.escape(d)}" for d in diag[:5])
+        diag_text = f"\n\n⚠️ <b>Catatan Mention:</b>\n{diag_lines}"
     await update.message.reply_html(
-        f"Selesai tes <code>{matched.id}</code>: {success} terkirim, {failed} gagal.",
+        f"Selesai tes <code>{matched.id}</code>: {success} terkirim, {failed} gagal.{diag_text}",
         reply_markup=build_back_menu_keyboard(),
     )
 
@@ -1262,7 +1436,14 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     try:
         jobs = load_schedules(config.schedules_file)
         scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-        count = register_jobs(scheduler, context.bot, jobs, config)
+        count = register_jobs(
+            scheduler,
+            context.bot,
+            jobs,
+            config,
+            context.bot_data.get("known_groups"),
+            context.bot_data.get("tag_presets"),
+        )
         context.bot_data["jobs"] = jobs
         await update.message.reply_html(
             f"🔄 Berhasil memuat ulang <code>{config.schedules_file}</code>. "
@@ -2366,7 +2547,11 @@ async def target_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     hints = {
         "group": ("👥 Tambah ID Grup", "<code>-1001234567890</code> atau <code>Grup Kantor | -1001234567890</code>"),
-        "user": ("👤 Tambah ID User", "<code>217411824</code> atau <code>Budi | 217411824</code>"),
+        "user": (
+            "👤 Tambah User (untuk Tag/Mention)",
+            "<code>@username</code>, <code>Budi | @username</code>, atau <code>Budi | 217411824</code>\n"
+            "<i>(Disarankan pakai @username agar mention selalu aktif 100%)</i>",
+        ),
         "channel": ("📢 Tambah ID / Username Channel", "<code>@namachannel</code>, <code>-1001234567890</code>, atau <code>Info Promo | @namachannel</code>"),
         "other": ("📌 Tambah Target Lainnya", "<code>Nama Bebas | ID_atau_@username</code>"),
     }
@@ -2399,14 +2584,21 @@ async def target_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return TARGET_ADD_INPUT
 
     target_type = str(context.user_data.pop("target_add_type", "other"))
-    final_id, auto_title, auto_type, fetched_ok = await resolve_chat_target(context.bot, target_id, target_type)
+    known_groups_now: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    final_id, auto_title, auto_type, fetched_ok, fetched_uname = await resolve_chat_target_details(
+        context.bot,
+        target_id,
+        target_type,
+        known_groups=known_groups_now,
+    )
     resolved_title = custom_label or auto_title
     resolved_type = auto_type if (fetched_ok and target_type == "other") else (auto_type if fetched_ok else target_type)
 
-    remember_group(context.bot_data, final_id, resolved_title, resolved_type)
+    remember_group(context.bot_data, final_id, resolved_title, resolved_type, username=fetched_uname)
     known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
     text, markup = format_targets_menu(known_groups)
 
+    uname_note = f" (@{html.escape(fetched_uname)})" if fetched_uname else ""
     note = ""
     if not custom_label and not fetched_ok:
         note = (
@@ -2416,7 +2608,7 @@ async def target_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_html(
         f"<b>✅ Target tersimpan!</b> {target_type_icon(resolved_type)} "
-        f"<b>{html.escape(resolved_title)}</b> (<code>{html.escape(str(final_id))}</code>){note}\n\n{text}",
+        f"<b>{html.escape(resolved_title)}</b>{uname_note} (<code>{html.escape(str(final_id))}</code>){note}\n\n{text}",
         reply_markup=markup,
     )
     return ConversationHandler.END
@@ -2693,23 +2885,30 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         updated_count = 0
         for cid_str, info in list(known_groups.items()):
             parsed_id = parse_single_target_id(cid_str)
-            final_id, title, rtype, fetched_ok = await resolve_chat_target(
+            final_id, title, rtype, fetched_ok, fetched_uname = await resolve_chat_target_details(
                 context.bot,
                 parsed_id,
                 info.get("type", "other"),
+                known_groups=known_groups,
             )
             if fetched_ok:
                 if str(final_id) != cid_str:
                     forget_group(context.bot_data, cid_str)
-                remember_group(context.bot_data, final_id, title, rtype)
+                # Pertahankan custom title untuk user jika sudah diberi nama sendiri
+                final_title = info.get("title") if (rtype in ("user", "private") and info.get("title") and info.get("title") != cid_str) else title
+                remember_group(context.bot_data, final_id, final_title, rtype, username=fetched_uname)
                 updated_count += 1
         refreshed = context.bot_data.get("known_groups", {})
         text, markup = format_targets_menu(refreshed)
-        await query.edit_message_text(
-            f"🔄 Refresh selesai! <b>{updated_count}</b> nama target berhasil diperbarui dari Telegram.\n\n{text}",
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
+        try:
+            await query.edit_message_text(
+                f"🔄 Refresh selesai! <b>{updated_count}</b> target &amp; username berhasil diperbarui dari Telegram.\n\n{text}",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
         return
 
     if data.startswith("tgtdel:"):
@@ -2798,7 +2997,11 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:history":
         history = load_delivery_history(config.resolved_history_file)
         text, markup = format_history_menu(history)
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as exc:
+            if "Message is not modified" not in str(exc):
+                raise
         return
 
     if data == "menu:backup":
@@ -2820,7 +3023,14 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:reload":
         try:
             jobs = load_schedules(config.schedules_file)
-            count = register_jobs(scheduler, context.bot, jobs, config)
+            count = register_jobs(
+                scheduler,
+                context.bot,
+                jobs,
+                config,
+                context.bot_data.get("known_groups"),
+                context.bot_data.get("tag_presets"),
+            )
             context.bot_data["jobs"] = jobs
             await query.edit_message_text(
                 f"🔄 Berhasil memuat ulang <code>{config.schedules_file}</code>.\n"
@@ -2846,17 +3056,23 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=build_back_menu_keyboard(),
             )
             return
+        diag: list[str] = []
         success, failed = await send_scheduled_message(
-        context.bot,
-        matched,
-        context.bot_data.get("known_groups"),
-        context.bot_data.get("tag_presets"),
-        config,
-        ignore_window=True,
-    )
+            context.bot,
+            matched,
+            context.bot_data.get("known_groups"),
+            context.bot_data.get("tag_presets"),
+            config,
+            ignore_window=True,
+            diagnostics=diag,
+        )
+        diag_text = ""
+        if diag:
+            diag_lines = "\n".join(f"• {html.escape(d)}" for d in diag[:5])
+            diag_text = f"\n\n⚠️ <b>Catatan Mention:</b>\n{diag_lines}"
         await query.edit_message_text(
             f"🚀 Tes kirim <code>{matched.id}</code> selesai:\n"
-            f"✅ Terkirim: <b>{success}</b> | ❌ Gagal: <b>{failed}</b>",
+            f"✅ Terkirim: <b>{success}</b> | ❌ Gagal: <b>{failed}</b>{diag_text}",
             parse_mode="HTML",
             reply_markup=build_back_menu_keyboard(),
         )
@@ -2867,10 +3083,17 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         jobs = context.bot_data.get("jobs", [])
         remaining = [j for j in jobs if j.id != target_id]
         save_schedules(config.schedules_file, remaining)
-        register_jobs(scheduler, context.bot, remaining, config)
+        register_jobs(
+            scheduler,
+            context.bot,
+            remaining,
+            config,
+            context.bot_data.get("known_groups"),
+            context.bot_data.get("tag_presets"),
+        )
         context.bot_data["jobs"] = remaining
 
-        text, markup = format_jobs_list_and_keyboard(scheduler)
+        text, markup = format_jobs_list_and_keyboard(scheduler, remaining)
         await query.edit_message_text(
             f"🗑️ Jadwal <code>{html.escape(target_id)}</code> dihapus.\n\n{text}",
             parse_mode="HTML",

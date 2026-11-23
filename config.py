@@ -437,10 +437,14 @@ def load_known_groups(path: str | Path) -> dict[str, dict[str, str]]:
     result: dict[str, dict[str, str]] = {}
     for cid, info in data.items():
         if isinstance(info, dict):
-            result[str(cid)] = {
+            entry: dict[str, str] = {
                 "title": str(info.get("title") or f"Grup {cid}"),
                 "type": str(info.get("type") or "group"),
             }
+            uname = str(info.get("username") or "").lstrip("@").strip()
+            if uname:
+                entry["username"] = uname
+            result[str(cid)] = entry
     return result
 
 
@@ -683,14 +687,52 @@ def parse_mentions(raw: str) -> list[str]:
     return parsed
 
 
-def format_mention_token(token: str, parse_mode: str | None = "HTML") -> str:
-    """Render satu token mention menjadi format siap kirim Telegram."""
+def format_mention_token(
+    token: str,
+    parse_mode: str | None = "HTML",
+    uid_usernames: dict[str, str] | None = None,
+) -> str:
+    """Render satu token mention menjadi format siap kirim Telegram.
+
+    Jika token berbentuk 'Nama:UserID' dan username Telegram user tersebut diketahui
+    (via uid_usernames), otomatis gunakan '@username' karena jauh lebih reliabel
+    di Telegram dibanding tg://user?id= (yang sering di-strip Telegram jika user
+    belum pernah /start bot atau membatasi privasi akun).
+    """
     if ":" in token:
         label, uid_str = token.rsplit(":", 1)
+        uid_clean = uid_str.strip()
+        if uid_usernames:
+            uname = (uid_usernames.get(uid_clean) or "").lstrip("@").strip()
+            if uname:
+                return f"@{uname}"
         if parse_mode and parse_mode.upper() == "HTML":
-            return f'<a href="tg://user?id={uid_str}">{html.escape(label)}</a>'
-        return f"[{label}](tg://user?id={uid_str})"
+            return f'<a href="tg://user?id={uid_clean}">{html.escape(label)}</a>'
+        return f"[{label}](tg://user?id={uid_clean})"
     return token if token.startswith("@") else f"@{token}"
+
+
+def extract_mention_user_ids(
+    message: str,
+    mentions: list[str] | None = None,
+    saved_targets: dict[str, dict[str, str]] | None = None,
+    tag_presets: dict[str, list[str]] | None = None,
+) -> list[str]:
+    """Ekstrak semua User ID numerik yang akan di-mention oleh sebuah pesan/jadwal."""
+    rendered_html = render_message_with_mentions(
+        message,
+        mentions=mentions,
+        parse_mode="HTML",
+        saved_targets=saved_targets,
+        tag_presets=tag_presets,
+    )
+    found: list[str] = []
+    seen: set[str] = set()
+    for uid in re.findall(r'tg://user\?id=(\d+)', rendered_html):
+        if uid not in seen:
+            seen.add(uid)
+            found.append(uid)
+    return found
 
 
 def render_message_with_mentions(
@@ -699,14 +741,28 @@ def render_message_with_mentions(
     parse_mode: str | None = "HTML",
     saved_targets: dict[str, dict[str, str]] | None = None,
     tag_presets: dict[str, list[str]] | None = None,
+    uid_usernames: dict[str, str] | None = None,
 ) -> str:
     """Gabungkan daftar mentions dengan isi pesan, serta auto-resolve @Nama, @NamaTim, @all/@semua, dan @[Nama](user_id)."""
     rendered = message
 
-    # 1. Konversi inline @[Nama](123456789) -> HTML/Markdown mention link
+    # Gabungkan peta uid -> username dari saved_targets + uid_usernames
+    merged_usernames: dict[str, str] = {}
+    for cid_str, info in (saved_targets or {}).items():
+        uname = (info.get("username") or "").lstrip("@").strip()
+        if uname and cid_str.lstrip("-").isdigit():
+            merged_usernames[cid_str] = uname
+    for uid_k, uname_v in (uid_usernames or {}).items():
+        uname = (uname_v or "").lstrip("@").strip()
+        if uname:
+            merged_usernames[str(uid_k)] = uname
+
+    # 1. Konversi inline @[Nama](123456789) -> @username (jika ada) atau HTML/Markdown mention link
     def _replace_inline(match: re.Match[str]) -> str:
         label = match.group(1).strip()
         uid = match.group(2).strip()
+        if uid in merged_usernames:
+            return f"@{merged_usernames[uid]}"
         if parse_mode and parse_mode.upper() == "HTML":
             return f'<a href="tg://user?id={uid}">{html.escape(label)}</a>'
         return f"[{label}](tg://user?id={uid})"
@@ -729,7 +785,11 @@ def render_message_with_mentions(
                 alias_map[cid_str.lstrip("@").lower()] = mention_str
             elif cid_str.lstrip("-").isdigit():
                 display = title or cid_str
-                mention_str = format_mention_token(f"{display}:{cid_str}", parse_mode)
+                mention_str = format_mention_token(
+                    f"{display}:{cid_str}",
+                    parse_mode,
+                    uid_usernames=merged_usernames,
+                )
             else:
                 continue
 
@@ -748,7 +808,10 @@ def render_message_with_mentions(
         for preset_name, preset_tokens in (tag_presets or {}).items():
             compact_preset = re.sub(r"\s+", "", preset_name).lower()
             if compact_preset and preset_tokens:
-                rendered_preset = " ".join(format_mention_token(t, parse_mode) for t in preset_tokens)
+                rendered_preset = " ".join(
+                    format_mention_token(t, parse_mode, uid_usernames=merged_usernames)
+                    for t in preset_tokens
+                )
                 alias_map[compact_preset] = rendered_preset
 
         all_joined = " ".join(all_user_mentions)
@@ -765,7 +828,10 @@ def render_message_with_mentions(
         rendered = re.sub(r"(?<![A-Za-z0-9_./])@([A-Za-z0-9_]{2,64})", _replace_at_token, rendered)
 
     if mentions:
-        tag_line = " ".join(format_mention_token(m, parse_mode) for m in mentions)
+        tag_line = " ".join(
+            format_mention_token(m, parse_mode, uid_usernames=merged_usernames)
+            for m in mentions
+        )
         rendered = f"{rendered}\n\n{tag_line}" if rendered else tag_line
 
     return rendered

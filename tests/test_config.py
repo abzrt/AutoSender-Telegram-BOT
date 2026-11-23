@@ -23,6 +23,7 @@ from bot import (
 from config import (
     BotConfig,
     ScheduleJob,
+    extract_mention_user_ids,
     load_config,
     load_extra_admins,
     load_known_groups,
@@ -112,6 +113,37 @@ def test_mentions_parsing_and_rendering() -> None:
 
     with pytest.raises(ValueError, match="tidak valid"):
         parse_mentions("Budi:abc")
+
+
+def test_mentions_upgrade_to_username_and_extract_uids(tmp_path: Path) -> None:
+    saved = {
+        "101": {"title": "Agus", "type": "user", "username": "agus_ok"},
+        "102": {"title": "Rafi", "type": "user"},
+        "103": {"title": "Sahril", "type": "user"},
+    }
+    groups_file = tmp_path / "groups.json"
+    save_known_groups(groups_file, saved)
+    reloaded = load_known_groups(groups_file)
+    assert reloaded["101"]["username"] == "agus_ok"
+    assert "username" not in reloaded["102"]
+
+    mentions = ["Agus:101", "Rafi:102", "Sahril:103", "Roy:104"]
+    uids = extract_mention_user_ids("Halo tim!", mentions=mentions, saved_targets=reloaded)
+    # 101 sudah pakai @agus_ok di saved_targets, sisanya numerik
+    assert uids == ["102", "103", "104"]
+
+    # Saat uid_usernames ditemukan dari get_chat_member, otomatis upgrade ke @username
+    rendered = render_message_with_mentions(
+        "Halo tim!",
+        mentions=mentions,
+        parse_mode="HTML",
+        saved_targets=reloaded,
+        uid_usernames={"102": "rafi_tg", "104": "roy_tg"},
+    )
+    assert "@agus_ok" in rendered
+    assert "@rafi_tg" in rendered
+    assert '<a href="tg://user?id=103">Sahril</a>' in rendered
+    assert "@roy_tg" in rendered
 
 
 def test_admin_persistence_and_parsing(tmp_path: Path) -> None:
