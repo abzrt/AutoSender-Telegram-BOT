@@ -2,6 +2,7 @@
 .env
 admins.json
 groups.json
+members.json
 php-cpanel/config.php
 php-cpanel/state.json
 php-cpanel/autosender.log

@@ -12,6 +12,7 @@ import pytest
 from bot import (
     build_custom_menu_keyboard,
     build_main_menu_keyboard,
+    build_mentions_picker_keyboard,
     build_target_picker_keyboard,
     build_trigger,
     format_targets_menu,
@@ -25,6 +26,7 @@ from config import (
     load_config,
     load_extra_admins,
     load_known_groups,
+    load_known_members,
     load_schedules,
     parse_flexible_schedule,
     parse_mentions,
@@ -32,8 +34,31 @@ from config import (
     render_message_with_mentions,
     save_extra_admins,
     save_known_groups,
+    save_known_members,
     save_schedules,
 )
+
+
+def test_known_members_and_mentions_picker(tmp_path: Path) -> None:
+    members_file = tmp_path / "members.json"
+    sample = {
+        "-1003977827975": {
+            "217411824": {"label": "ABZRT (@abzrt)", "token": "@abzrt"},
+            "172640153": {"label": "Nasir", "token": "Nasir:172640153"},
+        }
+    }
+    save_known_members(members_file, sample)
+    assert load_known_members(members_file) == sample
+
+    candidates = [
+        {"label": "ABZRT (@abzrt)", "token": "@abzrt"},
+        {"label": "Nasir", "token": "Nasir:172640153"},
+    ]
+    markup = build_mentions_picker_keyboard(candidates, ["@abzrt"], prefix="wiztag")
+    cbs = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "wiztag:t:0" in cbs
+    assert "wiztag:t:1" in cbs
+    assert "wiztag:done" in cbs
 
 
 def test_known_groups_and_target_picker(tmp_path: Path) -> None:

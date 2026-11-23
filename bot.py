@@ -44,6 +44,7 @@ from config import (
     load_config,
     load_extra_admins,
     load_known_groups,
+    load_known_members,
     load_schedules,
     parse_flexible_schedule,
     parse_mentions,
@@ -52,6 +53,7 @@ from config import (
     render_message_with_mentions,
     save_extra_admins,
     save_known_groups,
+    save_known_members,
     save_schedules,
 )
 
@@ -342,6 +344,124 @@ def forget_group(bot_data: dict[str, Any], chat_id: int | str) -> None:
         save_known_groups(config.resolved_groups_file, groups)
 
 
+def remember_member_user(bot_data: dict[str, Any], chat_id: int | str, user: Any) -> None:
+    """Catat satu user Telegram (non-bot) ke daftar anggota grup untuk checklist tag."""
+    if not user or getattr(user, "is_bot", False):
+        return
+    uid = getattr(user, "id", None)
+    if not uid:
+        return
+    username = getattr(user, "username", None)
+    first_name = (getattr(user, "first_name", None) or "").strip()
+    last_name = (getattr(user, "last_name", None) or "").strip()
+    full_name = " ".join(p for p in [first_name, last_name] if p).strip()
+
+    if username:
+        token = f"@{username}"
+        label = f"{full_name} (@{username})" if full_name else f"@{username}"
+    else:
+        clean_name = (full_name or f"User{uid}").replace(":", " ").strip()
+        token = f"{clean_name}:{uid}"
+        label = clean_name
+
+    config: BotConfig = bot_data["config"]
+    members: dict[str, dict[str, dict[str, str]]] = bot_data.setdefault("known_members", {})
+    scope_dict = members.setdefault(str(chat_id), {})
+    entry = {"label": label, "token": token}
+    if scope_dict.get(str(uid)) != entry:
+        scope_dict[str(uid)] = entry
+        save_known_members(config.resolved_members_file, members)
+
+
+def remember_manual_mentions(bot_data: dict[str, Any], mentions: list[str]) -> None:
+    """Simpan tag manual yang diketik user ke scope '_saved' agar bisa diklik lagi lain kali."""
+    if not mentions:
+        return
+    config: BotConfig = bot_data["config"]
+    members: dict[str, dict[str, dict[str, str]]] = bot_data.setdefault("known_members", {})
+    saved = members.setdefault("_saved", {})
+    changed = False
+    for token in mentions:
+        key = token.lower()
+        label = token.split(":", 1)[0] if ":" in token else token
+        entry = {"label": label, "token": token}
+        if saved.get(key) != entry:
+            saved[key] = entry
+            changed = True
+    if changed:
+        save_known_members(config.resolved_members_file, members)
+
+
+async def collect_mention_candidates(
+    bot: Bot,
+    bot_data: dict[str, Any],
+    chat_ids: list[int | str],
+) -> list[dict[str, str]]:
+    """Kumpulkan daftar kandidat anggota yang bisa di-tag dari grup target + tag tersimpan."""
+    for cid in chat_ids:
+        if isinstance(cid, int) and cid < 0:
+            try:
+                admins = await bot.get_chat_administrators(cid)
+                for member in admins:
+                    remember_member_user(bot_data, cid, member.user)
+            except TelegramError:
+                pass
+
+    members: dict[str, dict[str, dict[str, str]]] = bot_data.get("known_members", {})
+    candidates: list[dict[str, str]] = []
+    seen_tokens: set[str] = set()
+
+    scopes = [str(cid) for cid in chat_ids] + ["_saved"]
+    for scope in scopes:
+        for info in members.get(scope, {}).values():
+            token = info.get("token", "")
+            if token and token.lower() not in seen_tokens:
+                seen_tokens.add(token.lower())
+                candidates.append({"label": info.get("label") or token, "token": token})
+
+    candidates.sort(key=lambda item: item["label"].lower())
+    return candidates[:24]
+
+
+def build_mentions_picker_keyboard(
+    candidates: list[dict[str, str]],
+    selected_tokens: list[str],
+    prefix: str = "wiztag",
+    allow_clear: bool = False,
+) -> InlineKeyboardMarkup:
+    """Bangun keyboard checklist untuk memilih siapa saja yang akan di-tag."""
+    selected_lower = {t.lower() for t in selected_tokens}
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    row: list[InlineKeyboardButton] = []
+    for idx, item in enumerate(candidates):
+        label = item["label"]
+        if len(label) > 22:
+            label = label[:19] + "..."
+        mark = "☑️" if item["token"].lower() in selected_lower else "⬜"
+        row.append(InlineKeyboardButton(f"{mark} {label}", callback_data=f"{prefix}:t:{idx}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    action_row: list[InlineKeyboardButton] = []
+    if selected_tokens:
+        action_row.append(
+            InlineKeyboardButton(f"✅ Selesai ({len(selected_tokens)} di-tag)", callback_data=f"{prefix}:done")
+        )
+    else:
+        action_row.append(
+            InlineKeyboardButton("⏭️ Lewati (Tanpa Tag)", callback_data=f"{prefix}:done")
+        )
+    if allow_clear and selected_tokens:
+        action_row.append(InlineKeyboardButton("🧹 Kosongkan", callback_data=f"{prefix}:clear"))
+    buttons.append(action_row)
+    buttons.append([InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def extract_chat_title(chat_obj: Any) -> str:
     """Ambil nama terbaik dari objek Chat Telegram."""
     title = getattr(chat_obj, "title", None)
@@ -409,6 +529,8 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
     new_status = member.new_chat_member.status
     if new_status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
         remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
+    if update.effective_user:
+        remember_member_user(context.bot_data, chat.id, update.effective_user)
         logger.info("Grup tercatat otomatis: %s (%s)", chat.title, chat.id)
     elif new_status in (ChatMember.LEFT, ChatMember.BANNED):
         forget_group(context.bot_data, chat.id)
@@ -431,6 +553,8 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
+    if update.effective_user:
+        remember_member_user(context.bot_data, chat.id, update.effective_user)
 
 
 def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1113,22 +1237,80 @@ async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     wiz = context.user_data.setdefault("wiz", {})
     wiz["message"] = custom_msg
+    wiz["mentions"] = []
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("⏭️ Lewati (Tanpa Tag Tambahan)", callback_data="wiz:mentions:skip")],
-            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
-        ]
+    candidates = await collect_mention_candidates(context.bot, context.bot_data, wiz.get("chat_ids", []))
+    wiz["mention_candidates"] = candidates
+    keyboard = build_mentions_picker_keyboard(candidates, [], prefix="wiztag")
+    hint = (
+        f"Tersedia <b>{len(candidates)} nama</b> yang siap dipilih."
+        if candidates
+        else "<i>Belum ada anggota tercatat — ketik username di bawah atau kirim pesan di grup agar otomatis muncul.</i>"
     )
     await update.message.reply_html(
         "<b>🏷️ Tag / Mention Username (4/4 — Opsional)</b>\n\n"
-        "Ketik username siapa saja yang ingin di-tag di atas pesan (pisahkan spasi atau koma):\n"
-        "• <b>Dengan username:</b> <code>@budi @ani @siti</code>\n"
-        "• <b>Tanpa username (pakai User ID):</b> <code>Budi:123456789</code>\n\n"
-        "Atau klik <b>⏭️ Lewati</b> jika tidak perlu tag tambahan.",
+        f"{hint}\n\n"
+        "Klik centang nama di bawah lalu klik <b>✅ Selesai</b>, "
+        "atau ketik manual (contoh: <code>@budi @ani</code> / <code>Budi:123456789</code>):",
         reply_markup=keyboard,
     )
     return ASK_MENTIONS
+
+
+async def wiz_mentions_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    idx = int(query.data.split(":", 2)[2])
+    wiz = context.user_data.setdefault("wiz", {})
+    candidates: list[dict[str, str]] = wiz.get("mention_candidates", [])
+    if not (0 <= idx < len(candidates)):
+        return ASK_MENTIONS
+
+    token = candidates[idx]["token"]
+    selected: list[str] = list(wiz.get("mentions", []))
+    existing = next((t for t in selected if t.lower() == token.lower()), None)
+    if existing:
+        selected.remove(existing)
+    else:
+        selected.append(token)
+    wiz["mentions"] = selected
+
+    keyboard = build_mentions_picker_keyboard(candidates, selected, prefix="wiztag")
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return ASK_MENTIONS
+
+
+async def wiz_mentions_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    return await _show_wiz_confirmation(update, context)
+
+
+async def wiz_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return ASK_MENTIONS
+
+    try:
+        typed = parse_mentions(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return ASK_MENTIONS
+
+    remember_manual_mentions(context.bot_data, typed)
+    wiz = context.user_data.setdefault("wiz", {})
+    merged: list[str] = list(wiz.get("mentions", []))
+    seen = {t.lower() for t in merged}
+    for token in typed:
+        if token.lower() not in seen:
+            seen.add(token.lower())
+            merged.append(token)
+    wiz["mentions"] = merged
+    return await _show_wiz_confirmation(update, context)
 
 
 async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1160,29 +1342,6 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
     elif update.message:
         await update.message.reply_html(text, reply_markup=keyboard)
     return CONFIRM_SAVE
-
-
-async def wiz_mentions_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if not query:
-        return ConversationHandler.END
-    await query.answer()
-    context.user_data.setdefault("wiz", {})["mentions"] = []
-    return await _show_wiz_confirmation(update, context)
-
-
-async def wiz_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
-        return ASK_MENTIONS
-
-    try:
-        mentions = parse_mentions(update.message.text)
-    except ValueError as exc:
-        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
-        return ASK_MENTIONS
-
-    context.user_data.setdefault("wiz", {})["mentions"] = mentions
-    return await _show_wiz_confirmation(update, context)
 
 
 async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1500,24 +1659,96 @@ async def edit_ask_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     target_id = context.user_data.get("edit_job_id", "")
     jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
     matched = next((j for j in jobs if j.id == target_id), None)
-    current_tags = " ".join(matched.mentions) if (matched and matched.mentions) else "(tidak ada)"
+    current_mentions: list[str] = list(matched.mentions) if matched else []
+    chat_ids: list[int | str] = list(matched.chat_ids) if matched else []
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("🧹 Hapus Semua Tag", callback_data="editmentions:clear")],
-            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
-        ]
+    candidates = await collect_mention_candidates(context.bot, context.bot_data, chat_ids)
+    # Pastikan tag yang sudah ada di job juga muncul di kandidat
+    seen_c = {c["token"].lower() for c in candidates}
+    for tok in current_mentions:
+        if tok.lower() not in seen_c:
+            candidates.append({"label": tok.split(":", 1)[0] if ":" in tok else tok, "token": tok})
+
+    context.user_data["edit_mention_candidates"] = candidates
+    context.user_data["edit_selected_mentions"] = list(current_mentions)
+
+    current_tags = " ".join(current_mentions) if current_mentions else "(tidak ada)"
+    keyboard = build_mentions_picker_keyboard(
+        candidates,
+        current_mentions,
+        prefix="edittag",
+        allow_clear=True,
     )
     await query.edit_message_text(
         f"<b>🏷️ Ubah Tag / Mention</b> (<code>{html.escape(target_id)}</code>)\n\n"
         f"Tag saat ini: <code>{html.escape(current_tags)}</code>\n\n"
-        "Ketik username baru yang ingin di-tag (pisahkan spasi atau koma):\n"
-        "• <code>@budi @ani</code>\n"
-        "• <code>Budi:123456789</code> (jika akun tidak punya username)",
+        "Klik centang nama di bawah lalu klik <b>✅ Selesai</b>, "
+        "atau ketik manual (contoh: <code>@budi @ani</code> / <code>Budi:123456789</code>):",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
     return EDIT_NEW_MENTIONS
+
+
+async def edit_mentions_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    idx = int(query.data.split(":", 2)[2])
+    candidates: list[dict[str, str]] = context.user_data.get("edit_mention_candidates", [])
+    if not (0 <= idx < len(candidates)):
+        return EDIT_NEW_MENTIONS
+
+    token = candidates[idx]["token"]
+    selected: list[str] = list(context.user_data.get("edit_selected_mentions", []))
+    existing = next((t for t in selected if t.lower() == token.lower()), None)
+    if existing:
+        selected.remove(existing)
+    else:
+        selected.append(token)
+    context.user_data["edit_selected_mentions"] = selected
+
+    keyboard = build_mentions_picker_keyboard(candidates, selected, prefix="edittag", allow_clear=True)
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return EDIT_NEW_MENTIONS
+
+
+async def edit_mentions_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    selected: list[str] = list(context.user_data.pop("edit_selected_mentions", []))
+    context.user_data.pop("edit_mention_candidates", None)
+    return await _apply_edited_mentions(update, context, selected)
+
+
+async def edit_clear_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data.pop("edit_selected_mentions", None)
+    context.user_data.pop("edit_mention_candidates", None)
+    return await _apply_edited_mentions(update, context, [])
+
+
+async def edit_save_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return EDIT_NEW_MENTIONS
+
+    try:
+        mentions = parse_mentions(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return EDIT_NEW_MENTIONS
+
+    remember_manual_mentions(context.bot_data, mentions)
+    context.user_data.pop("edit_selected_mentions", None)
+    context.user_data.pop("edit_mention_candidates", None)
+    return await _apply_edited_mentions(update, context, mentions)
 
 
 async def _apply_edited_mentions(
@@ -1563,27 +1794,6 @@ async def _apply_edited_mentions(
     elif update.message:
         await update.message.reply_html(msg, reply_markup=keyboard)
     return ConversationHandler.END
-
-
-async def edit_clear_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if not query:
-        return ConversationHandler.END
-    await query.answer()
-    return await _apply_edited_mentions(update, context, [])
-
-
-async def edit_save_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
-        return EDIT_NEW_MENTIONS
-
-    try:
-        mentions = parse_mentions(update.message.text)
-    except ValueError as exc:
-        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
-        return EDIT_NEW_MENTIONS
-
-    return await _apply_edited_mentions(update, context, mentions)
 
 
 async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2032,6 +2242,7 @@ async def post_init(application: Application) -> None:
     jobs = load_schedules(config.schedules_file)
     extra_admins = load_extra_admins(config.resolved_admins_file)
     known_groups = load_known_groups(config.resolved_groups_file)
+    known_members = load_known_members(config.resolved_members_file)
 
     # Otomatis ambil nama grup dari chat_ids negatif yang sudah ada di schedules.json
     groups_updated = False
@@ -2068,6 +2279,7 @@ async def post_init(application: Application) -> None:
     application.bot_data["jobs"] = jobs
     application.bot_data["extra_admins"] = extra_admins
     application.bot_data["known_groups"] = known_groups
+    application.bot_data["known_members"] = known_members
 
     await application.bot.set_my_commands(
         [
@@ -2175,7 +2387,8 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_message_text),
             ],
             ASK_MENTIONS: [
-                CallbackQueryHandler(wiz_mentions_skip, pattern=r"^wiz:mentions:skip$"),
+                CallbackQueryHandler(wiz_mentions_toggle, pattern=r"^wiztag:t:\d+$"),
+                CallbackQueryHandler(wiz_mentions_done, pattern=r"^wiztag:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_mentions_text),
             ],
             CONFIRM_SAVE: [
@@ -2203,7 +2416,9 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_target_text),
             ],
             EDIT_NEW_MENTIONS: [
-                CallbackQueryHandler(edit_clear_mentions, pattern=r"^editmentions:clear$"),
+                CallbackQueryHandler(edit_mentions_toggle, pattern=r"^edittag:t:\d+$"),
+                CallbackQueryHandler(edit_mentions_done, pattern=r"^edittag:done$"),
+                CallbackQueryHandler(edit_clear_mentions, pattern=r"^edittag:clear$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_mentions_text),
             ],
             ADMIN_ADD_ID: [

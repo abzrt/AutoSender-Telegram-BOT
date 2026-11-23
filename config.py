@@ -274,6 +274,10 @@ class BotConfig:
     def resolved_groups_file(self) -> Path:
         return self.schedules_file.parent / "groups.json"
 
+    @property
+    def resolved_members_file(self) -> Path:
+        return self.schedules_file.parent / "members.json"
+
 
 def load_config(env_path: str | Path | None = None, require_token: bool = True) -> BotConfig:
     """Muat konfigurasi dari file .env dan environment variables."""
@@ -428,6 +432,38 @@ def save_known_groups(path: str | Path, groups: dict[str, dict[str, str]]) -> No
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(json.dumps(groups, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_known_members(path: str | Path) -> dict[str, dict[str, dict[str, str]]]:
+    """Muat daftar anggota grup & kontak mention dari members.json."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, dict[str, str]]] = {}
+    for scope, members in data.items():
+        if isinstance(members, dict):
+            cleaned: dict[str, dict[str, str]] = {}
+            for key, info in members.items():
+                if isinstance(info, dict) and info.get("token"):
+                    cleaned[str(key)] = {
+                        "label": str(info.get("label") or info["token"]),
+                        "token": str(info["token"]),
+                    }
+            result[str(scope)] = cleaned
+    return result
+
+
+def save_known_members(path: str | Path, members: dict[str, dict[str, dict[str, str]]]) -> None:
+    """Simpan daftar anggota grup & kontak mention ke members.json."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps(members, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def parse_user_ids(raw: str) -> list[int]:
