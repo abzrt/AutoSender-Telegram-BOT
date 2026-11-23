@@ -40,12 +40,18 @@ from telegram.ext import (
 from config import (
     BotConfig,
     ScheduleJob,
+    append_delivery_history,
     ensure_schedules_file,
+    format_active_window,
+    is_within_active_window,
     load_config,
+    load_delivery_history,
     load_extra_admins,
     load_known_groups,
     load_known_members,
     load_schedules,
+    load_tag_presets,
+    parse_active_window,
     parse_flexible_schedule,
     parse_mentions,
     parse_run_at,
@@ -55,6 +61,7 @@ from config import (
     save_known_groups,
     save_known_members,
     save_schedules,
+    save_tag_presets,
 )
 
 logging.basicConfig(
@@ -64,7 +71,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-autosender")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# State untuk ConversationHandler Custom Menu, Target Book, & Manajemen Admin
+# State untuk ConversationHandler Custom Menu, Target Book, Preset Tim, & Manajemen Admin
 (
     ASK_TARGET,
     ASK_DATETIME,
@@ -77,9 +84,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
     EDIT_NEW_TIME,
     EDIT_NEW_TARGET,
     EDIT_NEW_MENTIONS,
+    EDIT_NEW_HOURS,
     ADMIN_ADD_ID,
     TARGET_ADD_INPUT,
-) = range(13)
+    PRESET_ASK_NAME,
+    PRESET_PICK_MEMBERS,
+) = range(16)
 
 
 def parse_chat_ids(raw: str) -> list[int | str]:
@@ -161,10 +171,17 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
             ],
             [
-                InlineKeyboardButton("👑 Kelola Admin", callback_data="menu:admins"),
-                InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
+                InlineKeyboardButton("👥 Preset Tim", callback_data="menu:presets"),
+                InlineKeyboardButton("📜 Riwayat Kirim", callback_data="menu:history"),
             ],
-            [InlineKeyboardButton("🔄 Reload schedules.json", callback_data="menu:reload")],
+            [
+                InlineKeyboardButton("👑 Kelola Admin", callback_data="menu:admins"),
+                InlineKeyboardButton("💾 Backup Data", callback_data="menu:backup"),
+            ],
+            [
+                InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
+                InlineKeyboardButton("🔄 Reload", callback_data="menu:reload"),
+            ],
         ]
     )
 
@@ -435,10 +452,22 @@ def build_mentions_picker_keyboard(
     selected_tokens: list[str],
     prefix: str = "wiztag",
     allow_clear: bool = False,
+    preset_names: list[str] | None = None,
 ) -> InlineKeyboardMarkup:
-    """Bangun keyboard checklist untuk memilih siapa saja yang akan di-tag."""
+    """Bangun keyboard checklist untuk memilih siapa saja (atau preset tim) yang akan di-tag."""
     selected_lower = {t.lower() for t in selected_tokens}
     buttons: list[list[InlineKeyboardButton]] = []
+
+    if preset_names:
+        prow: list[InlineKeyboardButton] = []
+        for pidx, pname in enumerate(preset_names[:8]):
+            short = pname if len(pname) <= 18 else pname[:15] + "..."
+            prow.append(InlineKeyboardButton(f"👥 Tim: {short}", callback_data=f"{prefix}:p:{pidx}"))
+            if len(prow) == 2:
+                buttons.append(prow)
+                prow = []
+        if prow:
+            buttons.append(prow)
 
     row: list[InlineKeyboardButton] = []
     for idx, item in enumerate(candidates):
@@ -467,6 +496,75 @@ def build_mentions_picker_keyboard(
     buttons.append(action_row)
     buttons.append([InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")])
     return InlineKeyboardMarkup(buttons)
+
+
+def format_presets_menu(presets: dict[str, list[str]]) -> tuple[str, InlineKeyboardMarkup]:
+    """Susun tampilan menu Preset Tim / Shift Tag."""
+    lines = ["<b>👥 Preset Tim / Shift Tag</b>\n"]
+    if presets:
+        for name, tokens in sorted(presets.items(), key=lambda kv: kv[0].lower()):
+            compact = "".join(name.split())
+            preview = ", ".join(t.split(":", 1)[0] for t in tokens)
+            lines.append(f"• <b>{html.escape(name)}</b> (ketik <code>@{html.escape(compact)}</code>)\n  Anggota: <code>{html.escape(preview)}</code>")
+    else:
+        lines.append("<i>Belum ada preset tim. Buat preset supaya bisa tag 1 tim sekaligus dalam 1 klik!</i>")
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("➕ Buat Preset Tim Baru", callback_data="preset:new")]
+    ]
+    for idx, name in enumerate(sorted(presets.keys(), key=str.lower)):
+        buttons.append([InlineKeyboardButton(f"🗑️ Hapus Tim: {name[:22]}", callback_data=f"presetdel:{idx}")])
+    buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def format_history_menu(history: list[dict[str, Any]]) -> tuple[str, InlineKeyboardMarkup]:
+    """Susun tampilan Riwayat Pengiriman terakhir."""
+    lines = ["<b>📜 Riwayat Pengiriman Terakhir</b>\n"]
+    if not history:
+        lines.append("<i>Belum ada riwayat pengiriman tercatat.</i>")
+    else:
+        for entry in history[:15]:
+            icon = "✅" if entry.get("status") == "ok" else "❌"
+            ts = html.escape(str(entry.get("timestamp", "-")))
+            jid = html.escape(str(entry.get("job_id", "-")))
+            cid = html.escape(str(entry.get("chat_id", "-")))
+            err = entry.get("error")
+            line = f"{icon} <code>{ts}</code> | <code>{jid}</code> → <code>{cid}</code>"
+            if err:
+                line += f"\n    <i>{html.escape(str(err)[:80])}</i>"
+            lines.append(line)
+
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Refresh Riwayat", callback_data="menu:history")],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
+        ]
+    )
+    return "\n".join(lines), markup
+
+
+def build_active_hours_prompt(job_id: str, current_label: str) -> tuple[str, InlineKeyboardMarkup]:
+    text = (
+        f"<b>🕒 Atur Jam Operasional</b> (<code>{html.escape(job_id)}</code>)\n\n"
+        f"Saat ini: <code>{html.escape(current_label)}</code>\n\n"
+        "Pilih tombol cepat di bawah atau <b>ketik bebas</b>:\n"
+        "• <code>08:00-17:00</code> (setiap hari jam 08:00–17:00 WITA)\n"
+        "• <code>08:00-17:00 sen-jum</code> (Senin–Jumat saja)\n"
+        "• <code>08:00-17:00 sen,rab,jum</code> (hari tertentu)\n"
+        "• <code>24 jam</code> (nonaktifkan batasan jam)"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🏢 Jam Kerja (08:00-17:00 Sen-Jum)", callback_data="hours:q:08:00-17:00 sen-jum")],
+            [InlineKeyboardButton("☀️ Harian (08:00-21:00 Setiap Hari)", callback_data="hours:q:08:00-21:00")],
+            [
+                InlineKeyboardButton("🌐 24 Jam (Tanpa Batas)", callback_data="hours:q:24 jam"),
+                InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
+            ],
+        ]
+    )
+    return text, keyboard
 
 
 def extract_chat_title(chat_obj: Any) -> str:
@@ -601,8 +699,20 @@ async def send_scheduled_message(
     bot: Bot,
     job: ScheduleJob,
     saved_targets: dict[str, dict[str, str]] | None = None,
+    tag_presets: dict[str, list[str]] | None = None,
+    config: BotConfig | None = None,
+    ignore_window: bool = False,
 ) -> tuple[int, int]:
     """Kirim pesan dari satu ScheduleJob ke semua chat_ids."""
+    now = datetime.now(config.tzinfo) if config else datetime.now()
+    if not ignore_window and not is_within_active_window(job, now):
+        logger.info(
+            "Melewati job '%s' karena di luar jam operasional (%s)",
+            job.id,
+            format_active_window(job.active_hours, job.active_days),
+        )
+        return 0, 0
+
     success = 0
     failed = 0
     final_text = render_message_with_mentions(
@@ -610,9 +720,11 @@ async def send_scheduled_message(
         job.mentions,
         job.parse_mode,
         saved_targets=saved_targets,
+        tag_presets=tag_presets,
     )
 
     for chat_id in job.chat_ids:
+        err_msg: str | None = None
         try:
             if job.photo:
                 photo_path = Path(job.photo)
@@ -641,7 +753,21 @@ async def send_scheduled_message(
             logger.info("Job '%s' terkirim ke chat_id=%s", job.id, chat_id)
         except TelegramError as exc:
             failed += 1
+            err_msg = str(exc)
             logger.error("Gagal mengirim job '%s' ke chat_id=%s: %s", job.id, chat_id, exc)
+
+        if config is not None:
+            append_delivery_history(
+                config.resolved_history_file,
+                {
+                    "timestamp": now.strftime("%d/%m %H:%M:%S %Z"),
+                    "job_id": job.id,
+                    "job_name": job.name,
+                    "chat_id": str(chat_id),
+                    "status": "ok" if err_msg is None else "failed",
+                    "error": err_msg,
+                },
+            )
 
         await asyncio.sleep(0.05)
 
@@ -654,6 +780,7 @@ def register_jobs(
     jobs: list[ScheduleJob],
     config: BotConfig,
     saved_targets: dict[str, dict[str, str]] | None = None,
+    tag_presets: dict[str, list[str]] | None = None,
 ) -> int:
     """Daftarkan ulang semua jadwal aktif ke scheduler."""
     scheduler.remove_all_jobs()
@@ -662,7 +789,7 @@ def register_jobs(
 
     for job in jobs:
         if not job.enabled:
-            logger.info("Melewati jadwal nonaktif: %s (%s)", job.id, job.name)
+            logger.info("Melewati jadwal nonaktif/dijeda: %s (%s)", job.id, job.name)
             continue
 
         trigger = build_trigger(job, config.tzinfo)
@@ -675,7 +802,7 @@ def register_jobs(
         scheduler.add_job(
             send_scheduled_message,
             trigger=trigger,
-            args=[bot, job, saved_targets],
+            args=[bot, job, saved_targets, tag_presets, config, False],
             id=job.id,
             name=job.name,
             replace_existing=True,
@@ -765,12 +892,15 @@ def format_main_menu_text(update: Update, config: BotConfig, active_count: int) 
 
 def format_jobs_list_and_keyboard(
     scheduler: AsyncIOScheduler,
+    jobs: list[ScheduleJob] | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Susun teks daftar jadwal aktif beserta tombol Edit, Tes, & Hapus."""
-    scheduled = scheduler.get_jobs()
-    if not scheduled:
+    """Susun teks daftar jadwal (aktif & dijeda) beserta tombol Edit, Tes, & Hapus."""
+    scheduled_map = {ap_job.id: ap_job for ap_job in scheduler.get_jobs()}
+    display_jobs = jobs if jobs is not None else []
+
+    if not display_jobs and not scheduled_map:
         return (
-            "Belum ada jadwal aktif.\nKlik <b>✨ Custom Pesan &amp; Atur Waktu</b> untuk menambahkan.",
+            "Belum ada jadwal tersimpan.\nKlik <b>✨ Custom Pesan &amp; Atur Waktu</b> untuk menambahkan.",
             InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
@@ -779,26 +909,55 @@ def format_jobs_list_and_keyboard(
             ),
         )
 
-    lines = ["<b>📋 Daftar Jadwal Aktif:</b>\n"]
+    lines = ["<b>📋 Daftar Jadwal:</b>\n"]
     buttons: list[list[InlineKeyboardButton]] = []
 
-    for ap_job in scheduled:
-        next_run = (
-            ap_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
-            if ap_job.next_run_time
-            else "-"
-        )
-        lines.append(
-            f"• <b>{html.escape(ap_job.name)}</b> (<code>{ap_job.id}</code>)\n"
-            f"  ⏰ Berikutnya: <code>{next_run}</code>"
-        )
-        buttons.append(
-            [
-                InlineKeyboardButton(f"✏️ Edit {ap_job.id}", callback_data=f"editpick:{ap_job.id}"),
-                InlineKeyboardButton("🚀 Tes", callback_data=f"job:test:{ap_job.id}"),
-                InlineKeyboardButton("🗑️ Hapus", callback_data=f"job:del:{ap_job.id}"),
-            ]
-        )
+    if display_jobs:
+        for job in display_jobs:
+            ap_job = scheduled_map.get(job.id)
+            if not job.enabled:
+                status_icon = "⏸️"
+                next_run = "Dijeda (Pause)"
+            elif ap_job and ap_job.next_run_time:
+                status_icon = "🟢"
+                next_run = ap_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+            else:
+                status_icon = "⚪"
+                next_run = "Sudah lewat"
+
+            win_str = ""
+            if job.active_hours or job.active_days:
+                win_str = f"\n  🕒 Jam aktif: <code>{format_active_window(job.active_hours, job.active_days)}</code>"
+
+            lines.append(
+                f"{status_icon} <b>{html.escape(job.name)}</b> (<code>{job.id}</code>)\n"
+                f"  ⏰ Berikutnya: <code>{next_run}</code>{win_str}"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(f"⚙️ Kelola {job.id}", callback_data=f"editpick:{job.id}"),
+                    InlineKeyboardButton("🚀 Tes", callback_data=f"job:test:{job.id}"),
+                    InlineKeyboardButton("🗑️ Hapus", callback_data=f"job:del:{job.id}"),
+                ]
+            )
+    else:
+        for ap_job in scheduled_map.values():
+            next_run = (
+                ap_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                if ap_job.next_run_time
+                else "-"
+            )
+            lines.append(
+                f"🟢 <b>{html.escape(ap_job.name)}</b> (<code>{ap_job.id}</code>)\n"
+                f"  ⏰ Berikutnya: <code>{next_run}</code>"
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(f"⚙️ Kelola {ap_job.id}", callback_data=f"editpick:{ap_job.id}"),
+                    InlineKeyboardButton("🚀 Tes", callback_data=f"job:test:{ap_job.id}"),
+                    InlineKeyboardButton("🗑️ Hapus", callback_data=f"job:del:{ap_job.id}"),
+                ]
+            )
 
     buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
@@ -823,6 +982,7 @@ def save_new_custom_job(
     spec: dict[str, Any],
     custom_msg: str,
     mentions: list[str] | None = None,
+    photo: str | None = None,
 ) -> ScheduleJob:
     """Buat, simpan ke schedules.json, dan daftarkan jadwal custom baru."""
     config: BotConfig = context.bot_data["config"]
@@ -849,6 +1009,7 @@ def save_new_custom_job(
         seconds=spec.get("seconds"),
         chat_ids=chat_ids,
         message=custom_msg,
+        photo=photo,
         mentions=list(mentions or []),
         enabled=True,
         parse_mode="HTML",
@@ -859,7 +1020,14 @@ def save_new_custom_job(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
     return new_job
 
@@ -989,7 +1157,14 @@ async def cmd_setpesan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     matched.message = new_text
     save_schedules(config.schedules_file, jobs)
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
 
     await update.message.reply_html(
@@ -1038,7 +1213,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    text, markup = format_jobs_list_and_keyboard(scheduler)
+    text, markup = format_jobs_list_and_keyboard(scheduler, context.bot_data.get("jobs", []))
     await update.message.reply_html(text, reply_markup=markup)
 
 
@@ -1062,7 +1237,14 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_html(f"🚀 Mengirim tes untuk job <code>{matched.id}</code>...")
-    success, failed = await send_scheduled_message(context.bot, matched, context.bot_data.get("known_groups"))
+    success, failed = await send_scheduled_message(
+        context.bot,
+        matched,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+        config,
+        ignore_window=True,
+    )
     await update.message.reply_html(
         f"Selesai tes <code>{matched.id}</code>: {success} terkirim, {failed} gagal.",
         reply_markup=build_back_menu_keyboard(),
@@ -1240,33 +1422,83 @@ async def wiz_datetime_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
+    if not update.message:
         return ASK_MESSAGE
 
-    custom_msg = update.message.text.strip()
-    if not custom_msg:
-        await update.message.reply_text("Pesan tidak boleh kosong. Ketik pesanmu:", reply_markup=build_cancel_keyboard())
+    photo_id: str | None = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+        custom_msg = (update.message.caption or "").strip()
+    elif update.message.text:
+        custom_msg = update.message.text.strip()
+    else:
+        return ASK_MESSAGE
+
+    if not custom_msg and not photo_id:
+        await update.message.reply_text("Pesan atau foto tidak boleh kosong. Kirim pesan/foto:", reply_markup=build_cancel_keyboard())
         return ASK_MESSAGE
 
     wiz = context.user_data.setdefault("wiz", {})
     wiz["message"] = custom_msg
+    wiz["photo"] = photo_id
     wiz["mentions"] = []
 
     candidates = await collect_mention_candidates(context.bot, context.bot_data, wiz.get("chat_ids", []))
+    presets: dict[str, list[str]] = context.bot_data.get("tag_presets", {})
+    preset_names = sorted(presets.keys(), key=str.lower)
     wiz["mention_candidates"] = candidates
-    keyboard = build_mentions_picker_keyboard(candidates, [], prefix="wiztag")
+    wiz["preset_names"] = preset_names
+
+    keyboard = build_mentions_picker_keyboard(candidates, [], prefix="wiztag", preset_names=preset_names)
     hint = (
-        f"Tersedia <b>{len(candidates)} user tersimpan</b> yang siap dipilih."
-        if candidates
+        f"Tersedia <b>{len(candidates)} user tersimpan</b>"
+        + (f" &amp; <b>{len(preset_names)} preset tim</b>" if preset_names else "")
+        + " yang siap dipilih."
+        if (candidates or preset_names)
         else "<i>Belum ada user tersimpan — tambahkan lewat 📇 Kelola Target (👤 User) atau ketik manual di bawah.</i>"
     )
     await update.message.reply_html(
         "<b>🏷️ Tag / Mention Username (4/4 — Opsional)</b>\n\n"
         f"{hint}\n\n"
-        "Klik centang nama di bawah lalu klik <b>✅ Selesai</b>, "
+        "Klik centang nama / preset tim di bawah lalu klik <b>✅ Selesai</b>, "
         "atau ketik manual (contoh: <code>@budi @ani</code> / <code>Budi:123456789</code>):",
         reply_markup=keyboard,
     )
+    return ASK_MENTIONS
+
+
+async def wiz_mentions_preset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    pidx = int(query.data.split(":", 2)[2])
+    wiz = context.user_data.setdefault("wiz", {})
+    preset_names: list[str] = wiz.get("preset_names", [])
+    if not (0 <= pidx < len(preset_names)):
+        return ASK_MENTIONS
+
+    pname = preset_names[pidx]
+    presets: dict[str, list[str]] = context.bot_data.get("tag_presets", {})
+    team_tokens = presets.get(pname, [])
+
+    selected: list[str] = list(wiz.get("mentions", []))
+    sel_lower = {t.lower() for t in selected}
+    if all(t.lower() in sel_lower for t in team_tokens):
+        # Toggle off jika semua anggota tim sudah tercentang
+        team_lower = {t.lower() for t in team_tokens}
+        selected = [t for t in selected if t.lower() not in team_lower]
+    else:
+        for t in team_tokens:
+            if t.lower() not in sel_lower:
+                sel_lower.add(t.lower())
+                selected.append(t)
+    wiz["mentions"] = selected
+
+    candidates: list[dict[str, str]] = wiz.get("mention_candidates", [])
+    keyboard = build_mentions_picker_keyboard(candidates, selected, prefix="wiztag", preset_names=preset_names)
+    await query.edit_message_reply_markup(reply_markup=keyboard)
     return ASK_MENTIONS
 
 
@@ -1291,7 +1523,12 @@ async def wiz_mentions_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE
         selected.append(token)
     wiz["mentions"] = selected
 
-    keyboard = build_mentions_picker_keyboard(candidates, selected, prefix="wiztag")
+    keyboard = build_mentions_picker_keyboard(
+        candidates,
+        selected,
+        prefix="wiztag",
+        preset_names=wiz.get("preset_names", []),
+    )
     await query.edit_message_reply_markup(reply_markup=keyboard)
     return ASK_MENTIONS
 
@@ -1331,8 +1568,10 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
     spec: dict[str, Any] = wiz["spec"]
     chat_ids = wiz["chat_ids"]
     custom_msg: str = wiz["message"]
+    photo_id: str | None = wiz.get("photo")
     mentions: list[str] = wiz.get("mentions", [])
     tags_preview = " ".join(mentions) if mentions else "(tidak ada)"
+    photo_line = "🖼️ Foto: <code>Terlampir</code>\n" if photo_id else ""
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -1346,8 +1585,9 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
         "<b>🔍 Konfirmasi Pesan Terjadwal</b>\n\n"
         f"🎯 Target: <code>{chat_ids}</code>\n"
         f"⏰ Waktu: <code>{html.escape(spec['label'])}</code>\n"
+        f"{photo_line}"
         f"🏷️ Tag: <code>{html.escape(tags_preview)}</code>\n"
-        f"✉️ Pesan:\n{html.escape(custom_msg)}\n\n"
+        f"✉️ Pesan:\n{html.escape(custom_msg or '(tanpa teks)')}\n\n"
         "Klik <b>✅ Simpan Jadwal</b> untuk mengaktifkan."
     )
     if update.callback_query:
@@ -1374,9 +1614,10 @@ async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     spec: dict[str, Any] = wiz["spec"]
     chat_ids: list[int | str] = wiz["chat_ids"]
     custom_msg: str = wiz["message"]
+    photo_id: str | None = wiz.get("photo")
     mentions: list[str] = wiz.get("mentions", [])
 
-    new_job = save_new_custom_job(context, chat_ids, spec, custom_msg, mentions=mentions)
+    new_job = save_new_custom_job(context, chat_ids, spec, custom_msg, mentions=mentions, photo=photo_id)
     tags_label = " ".join(mentions) if mentions else "-"
     keyboard = InlineKeyboardMarkup(
         [
@@ -1465,15 +1706,24 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data["edit_job_id"] = matched.id
     tags_display = " ".join(matched.mentions) if matched.mentions else "(tidak ada)"
+    status_display = "🟢 Aktif" if matched.enabled else "⏸️ Dijeda (Pause)"
+    toggle_label = "⏸️ Pause Jadwal" if matched.enabled else "▶️ Aktifkan Jadwal"
+    hours_display = format_active_window(matched.active_hours, matched.active_days)
+    photo_display = "🖼️ Terlampir" if matched.photo else "-"
+
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✏️ Ubah Pesan", callback_data="editact:msg"),
+                InlineKeyboardButton("✏️ Ubah Pesan/Foto", callback_data="editact:msg"),
                 InlineKeyboardButton("⏰ Ubah Waktu", callback_data="editact:time"),
             ],
             [
                 InlineKeyboardButton("🎯 Ubah Chat ID", callback_data="editact:target"),
                 InlineKeyboardButton("🏷️ Ubah Tag", callback_data="editact:mentions"),
+            ],
+            [
+                InlineKeyboardButton("🕒 Jam Operasional", callback_data="editact:hours"),
+                InlineKeyboardButton(toggle_label, callback_data="editact:toggle"),
             ],
             [
                 InlineKeyboardButton("🚀 Tes Kirim", callback_data=f"job:test:{matched.id}"),
@@ -1483,15 +1733,130 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
     await query.edit_message_text(
         f"<b>⚙️ Kelola Jadwal: {html.escape(matched.name)}</b> (<code>{matched.id}</code>)\n\n"
-        f"⏰ <b>Waktu saat ini:</b> <code>{html.escape(describe_job_time(matched))}</code>\n"
+        f"📌 <b>Status:</b> {status_display}\n"
+        f"⏰ <b>Waktu:</b> <code>{html.escape(describe_job_time(matched))}</code>\n"
+        f"🕒 <b>Jam Operasional:</b> <code>{html.escape(hours_display)}</code>\n"
         f"🎯 <b>Target:</b> <code>{matched.chat_ids}</code>\n"
+        f"🖼️ <b>Foto:</b> {photo_display}\n"
         f"🏷️ <b>Tag:</b> <code>{html.escape(tags_display)}</code>\n"
-        f"✉️ <b>Pesan saat ini:</b>\n{html.escape(matched.message or '(kosong)')}\n\n"
+        f"✉️ <b>Pesan:</b>\n{html.escape(matched.message or '(kosong)')}\n\n"
         "Apa yang ingin kamu ubah?",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
     return EDIT_ACTION
+
+
+async def edit_toggle_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Pause atau aktifkan kembali jadwal dalam 1 klik."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    if not matched:
+        await query.edit_message_text("Jadwal tidak ditemukan.", reply_markup=build_back_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.enabled = not matched.enabled
+    save_schedules(config.schedules_file, jobs)
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
+    context.bot_data["jobs"] = jobs
+
+    # Refresh tampilan detail jadwal
+    query.data = f"editpick:{matched.id}"
+    return await edit_show_actions(update, context)
+
+
+async def edit_ask_hours(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    current = format_active_window(matched.active_hours, matched.active_days) if matched else "24 Jam"
+    text, keyboard = build_active_hours_prompt(target_id, current)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    return EDIT_NEW_HOURS
+
+
+async def _apply_edited_hours(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    active_hours: str | None,
+    active_days: list[int] | None,
+) -> int:
+    target_id = context.user_data.pop("edit_job_id", None)
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    if not matched:
+        if update.callback_query:
+            await update.callback_query.edit_message_text("Sesi edit kedaluwarsa.", reply_markup=build_main_menu_keyboard())
+        elif update.message:
+            await update.message.reply_text("Sesi edit kedaluwarsa.", reply_markup=build_main_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.active_hours = active_hours
+    matched.active_days = active_days
+    save_schedules(config.schedules_file, jobs)
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
+    context.bot_data["jobs"] = jobs
+
+    label = format_active_window(active_hours, active_days)
+    msg = (
+        f"<b>✅ Jam operasional untuk <code>{matched.id}</code> diperbarui!</b>\n\n"
+        f"🕒 <b>Jam Aktif:</b> <code>{html.escape(label)}</code>"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=build_back_menu_keyboard())
+    elif update.message:
+        await update.message.reply_html(msg, reply_markup=build_back_menu_keyboard())
+    return ConversationHandler.END
+
+
+async def edit_save_hours_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+    expr = query.data.split(":", 2)[2]
+    ah, ad = parse_active_window(expr)
+    return await _apply_edited_hours(update, context, ah, ad)
+
+
+async def edit_save_hours_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return EDIT_NEW_HOURS
+    try:
+        ah, ad = parse_active_window(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return EDIT_NEW_HOURS
+    return await _apply_edited_hours(update, context, ah, ad)
 
 
 async def edit_ask_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1612,7 +1977,14 @@ async def _apply_edited_target(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
 
     keyboard = InlineKeyboardMarkup(
@@ -1788,7 +2160,14 @@ async def _apply_edited_mentions(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
 
     tags_label = " ".join(mentions) if mentions else "(kosong / dihapus)"
@@ -1810,12 +2189,20 @@ async def _apply_edited_mentions(
 
 
 async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not update.message or not update.message.text:
+    if not update.message:
         return EDIT_NEW_MESSAGE
 
-    new_text = update.message.text.strip()
-    if not new_text:
-        await update.message.reply_text("Pesan tidak boleh kosong. Ketik pesan baru:", reply_markup=build_cancel_keyboard())
+    photo_id: str | None = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+        new_text = (update.message.caption or "").strip()
+    elif update.message.text:
+        new_text = update.message.text.strip()
+    else:
+        return EDIT_NEW_MESSAGE
+
+    if not new_text and not photo_id:
+        await update.message.reply_text("Pesan atau foto tidak boleh kosong:", reply_markup=build_cancel_keyboard())
         return EDIT_NEW_MESSAGE
 
     target_id = context.user_data.pop("edit_job_id", None)
@@ -1827,10 +2214,18 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     matched.message = new_text
+    matched.photo = photo_id
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
 
     keyboard = InlineKeyboardMarkup(
@@ -1839,9 +2234,10 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
+    photo_note = "\n🖼️ <b>Foto baru terlampir!</b>" if photo_id else ""
     await update.message.reply_html(
-        f"<b>✅ Pesan custom untuk <code>{matched.id}</code> berhasil diperbarui!</b>\n\n"
-        f"<b>Pesan baru:</b>\n{html.escape(new_text)}",
+        f"<b>✅ Pesan custom untuk <code>{matched.id}</code> berhasil diperbarui!</b>{photo_note}\n\n"
+        f"<b>Pesan baru:</b>\n{html.escape(new_text or '(tanpa teks)')}",
         reply_markup=keyboard,
     )
     return ConversationHandler.END
@@ -1871,7 +2267,14 @@ async def _apply_edited_time(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
     context.bot_data["jobs"] = jobs
 
     msg = (
@@ -2017,6 +2420,186 @@ async def target_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=markup,
     )
     return ConversationHandler.END
+
+
+async def preset_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data.pop("new_preset", None)
+    await query.edit_message_text(
+        "<b>👥 Buat Preset Tim Baru (1/2)</b>\n\n"
+        "Ketik <b>nama tim/shift</b> (contoh: <code>Shift Pagi</code> atau <code>Tim QC</code>):",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    return PRESET_ASK_NAME
+
+
+async def preset_name_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return PRESET_ASK_NAME
+    name = update.message.text.strip()
+    if not name or len(name) > 40:
+        await update.message.reply_text("Nama tim harus 1–40 karakter:", reply_markup=build_cancel_keyboard())
+        return PRESET_ASK_NAME
+
+    candidates = await collect_mention_candidates(context.bot, context.bot_data, [])
+    context.user_data["new_preset"] = {"name": name, "candidates": candidates, "selected": []}
+    keyboard = build_mentions_picker_keyboard(candidates, [], prefix="prpick")
+    await update.message.reply_html(
+        f"<b>👥 Pilih Anggota untuk '{html.escape(name)}' (2/2)</b>\n\n"
+        "Klik centang user di bawah lalu klik <b>✅ Selesai</b>, "
+        "atau ketik manual (contoh: <code>@budi @ani</code> / <code>Budi:123456789</code>):",
+        reply_markup=keyboard,
+    )
+    return PRESET_PICK_MEMBERS
+
+
+async def preset_pick_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+    idx = int(query.data.split(":", 2)[2])
+    np = context.user_data.setdefault("new_preset", {})
+    candidates: list[dict[str, str]] = np.get("candidates", [])
+    if not (0 <= idx < len(candidates)):
+        return PRESET_PICK_MEMBERS
+    tok = candidates[idx]["token"]
+    selected: list[str] = list(np.get("selected", []))
+    existing = next((t for t in selected if t.lower() == tok.lower()), None)
+    if existing:
+        selected.remove(existing)
+    else:
+        selected.append(tok)
+    np["selected"] = selected
+    await query.edit_message_reply_markup(reply_markup=build_mentions_picker_keyboard(candidates, selected, prefix="prpick"))
+    return PRESET_PICK_MEMBERS
+
+
+async def _save_new_preset(update: Update, context: ContextTypes.DEFAULT_TYPE, tokens: list[str]) -> int:
+    np = context.user_data.pop("new_preset", None)
+    if not np or not tokens:
+        if update.callback_query:
+            await update.callback_query.answer("Pilih minimal 1 anggota tim!", show_alert=True)
+            return PRESET_PICK_MEMBERS
+        if update.message:
+            await update.message.reply_text("Masukkan minimal 1 anggota tim:", reply_markup=build_cancel_keyboard())
+            return PRESET_PICK_MEMBERS
+        return ConversationHandler.END
+
+    name: str = np["name"]
+    config: BotConfig = context.bot_data["config"]
+    presets: dict[str, list[str]] = dict(context.bot_data.get("tag_presets", {}))
+    presets[name] = tokens
+    save_tag_presets(config.resolved_presets_file, presets)
+    context.bot_data["tag_presets"] = presets
+
+    # Update scheduler agar @NamaTim langsung aktif di job berjalan
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"), presets)
+
+    text, markup = format_presets_menu(presets)
+    msg = f"<b>✅ Preset Tim '{html.escape(name)}' tersimpan!</b>\n\n{text}"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=markup)
+    elif update.message:
+        await update.message.reply_html(msg, reply_markup=markup)
+    return ConversationHandler.END
+
+
+async def preset_pick_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    np = context.user_data.get("new_preset", {})
+    selected: list[str] = list(np.get("selected", []))
+    if not selected:
+        await query.answer("Pilih minimal 1 anggota tim terlebih dahulu!", show_alert=True)
+        return PRESET_PICK_MEMBERS
+    await query.answer()
+    return await _save_new_preset(update, context, selected)
+
+
+async def preset_pick_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return PRESET_PICK_MEMBERS
+    try:
+        typed = parse_mentions(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return PRESET_PICK_MEMBERS
+    remember_manual_mentions(context.bot_data, typed)
+    np = context.user_data.setdefault("new_preset", {})
+    merged: list[str] = list(np.get("selected", []))
+    seen = {t.lower() for t in merged}
+    for tok in typed:
+        if tok.lower() not in seen:
+            seen.add(tok.lower())
+            merged.append(tok)
+    return await _save_new_preset(update, context, merged)
+
+
+async def send_backup_files(chat_id: int, bot: Bot, config: BotConfig) -> int:
+    """Kirim file JSON backup ke chat admin."""
+    files = [
+        config.schedules_file,
+        config.resolved_groups_file,
+        config.resolved_admins_file,
+        config.resolved_presets_file,
+    ]
+    sent = 0
+    for fpath in files:
+        if fpath.exists() and fpath.is_file():
+            with fpath.open("rb") as fh:
+                await bot.send_document(chat_id=chat_id, document=fh, filename=fpath.name)
+            sent += 1
+    return sent
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.effective_chat:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    count = await send_backup_files(update.effective_chat.id, context.bot, config)
+    await update.message.reply_html(
+        f"💾 <b>Backup selesai!</b> {count} file konfigurasi telah dikirim.",
+        reply_markup=build_back_menu_keyboard(),
+    )
+
+
+async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    history = load_delivery_history(config.resolved_history_file)
+    text, markup = format_history_menu(history)
+    await update.message.reply_html(text, reply_markup=markup)
+
+
+async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    presets: dict[str, list[str]] = context.bot_data.get("tag_presets", {})
+    text, markup = format_presets_menu(presets)
+    await update.message.reply_html(text, reply_markup=markup)
 
 
 async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2187,8 +2770,50 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if data == "menu:presets":
+        presets: dict[str, list[str]] = context.bot_data.get("tag_presets", {})
+        text, markup = format_presets_menu(presets)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("presetdel:"):
+        idx = int(data.split(":", 1)[1])
+        presets = dict(context.bot_data.get("tag_presets", {}))
+        names = sorted(presets.keys(), key=str.lower)
+        if 0 <= idx < len(names):
+            removed = names[idx]
+            presets.pop(removed, None)
+            save_tag_presets(config.resolved_presets_file, presets)
+            context.bot_data["tag_presets"] = presets
+            jobs_list: list[ScheduleJob] = context.bot_data.get("jobs", [])
+            register_jobs(scheduler, context.bot, jobs_list, config, context.bot_data.get("known_groups"), presets)
+            text, markup = format_presets_menu(presets)
+            await query.edit_message_text(
+                f"🗑️ Preset tim <b>{html.escape(removed)}</b> dihapus.\n\n{text}",
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        return
+
+    if data == "menu:history":
+        history = load_delivery_history(config.resolved_history_file)
+        text, markup = format_history_menu(history)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data == "menu:backup":
+        chat = update.effective_chat
+        if chat:
+            count = await send_backup_files(chat.id, context.bot, config)
+            await query.edit_message_text(
+                f"💾 <b>Backup selesai!</b> {count} file konfigurasi telah dikirim ke chat ini.",
+                parse_mode="HTML",
+                reply_markup=build_back_menu_keyboard(),
+            )
+        return
+
     if data == "menu:list":
-        text, markup = format_jobs_list_and_keyboard(scheduler)
+        text, markup = format_jobs_list_and_keyboard(scheduler, context.bot_data.get("jobs", []))
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
         return
 
@@ -2221,7 +2846,14 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=build_back_menu_keyboard(),
             )
             return
-        success, failed = await send_scheduled_message(context.bot, matched, context.bot_data.get("known_groups"))
+        success, failed = await send_scheduled_message(
+        context.bot,
+        matched,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+        config,
+        ignore_window=True,
+    )
         await query.edit_message_text(
             f"🚀 Tes kirim <code>{matched.id}</code> selesai:\n"
             f"✅ Terkirim: <b>{success}</b> | ❌ Gagal: <b>{failed}</b>",
@@ -2256,6 +2888,7 @@ async def post_init(application: Application) -> None:
     extra_admins = load_extra_admins(config.resolved_admins_file)
     known_groups = load_known_groups(config.resolved_groups_file)
     known_members = load_known_members(config.resolved_members_file)
+    tag_presets = load_tag_presets(config.resolved_presets_file)
 
     # Otomatis ambil nama grup dari chat_ids negatif yang sudah ada di schedules.json
     groups_updated = False
@@ -2285,7 +2918,7 @@ async def post_init(application: Application) -> None:
         save_known_groups(config.resolved_groups_file, known_groups)
 
     scheduler = AsyncIOScheduler(timezone=config.tzinfo)
-    register_jobs(scheduler, application.bot, jobs, config, known_groups)
+    register_jobs(scheduler, application.bot, jobs, config, known_groups, tag_presets)
     scheduler.start()
 
     application.bot_data["scheduler"] = scheduler
@@ -2293,17 +2926,19 @@ async def post_init(application: Application) -> None:
     application.bot_data["extra_admins"] = extra_admins
     application.bot_data["known_groups"] = known_groups
     application.bot_data["known_members"] = known_members
+    application.bot_data["tag_presets"] = tag_presets
 
     await application.bot.set_my_commands(
         [
             BotCommand("menu", "Buka menu utama interaktif"),
             BotCommand("targets", "Kelola ID Grup/User/Channel"),
+            BotCommand("presets", "Kelola preset tim/shift tag"),
+            BotCommand("history", "Lihat riwayat pengiriman"),
+            BotCommand("backup", "Backup file konfigurasi"),
             BotCommand("admin", "Kelola daftar admin bot"),
             BotCommand("schedule", "Buat jadwal pesan cepat"),
-            BotCommand("setpesan", "Ubah custom pesan jadwal"),
-            BotCommand("list", "Lihat daftar jadwal aktif"),
+            BotCommand("list", "Lihat daftar jadwal"),
             BotCommand("chatid", "Cek Chat ID saat ini"),
-            BotCommand("reload", "Muat ulang schedules.json"),
             BotCommand("cancel", "Batalkan proses saat ini"),
         ]
     )
@@ -2385,6 +3020,7 @@ def main() -> None:
             CallbackQueryHandler(edit_show_actions, pattern=r"^editpick:.+$"),
             CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"),
             CallbackQueryHandler(target_add_start, pattern=r"^tgtadd:.+$"),
+            CallbackQueryHandler(preset_new_start, pattern=r"^preset:new$"),
         ],
         states={
             ASK_TARGET: [
@@ -2397,9 +3033,10 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_datetime_text),
             ],
             ASK_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_message_text),
+                MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), wiz_message_text),
             ],
             ASK_MENTIONS: [
+                CallbackQueryHandler(wiz_mentions_preset, pattern=r"^wiztag:p:\d+$"),
                 CallbackQueryHandler(wiz_mentions_toggle, pattern=r"^wiztag:t:\d+$"),
                 CallbackQueryHandler(wiz_mentions_done, pattern=r"^wiztag:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_mentions_text),
@@ -2415,9 +3052,11 @@ def main() -> None:
                 CallbackQueryHandler(edit_ask_time, pattern=r"^editact:time$"),
                 CallbackQueryHandler(edit_ask_target, pattern=r"^editact:target$"),
                 CallbackQueryHandler(edit_ask_mentions, pattern=r"^editact:mentions$"),
+                CallbackQueryHandler(edit_ask_hours, pattern=r"^editact:hours$"),
+                CallbackQueryHandler(edit_toggle_enabled, pattern=r"^editact:toggle$"),
             ],
             EDIT_NEW_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_message),
+                MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), edit_save_message),
             ],
             EDIT_NEW_TIME: [
                 CallbackQueryHandler(edit_save_time_quick, pattern=r"^time:quick:.+$"),
@@ -2434,18 +3073,30 @@ def main() -> None:
                 CallbackQueryHandler(edit_clear_mentions, pattern=r"^edittag:clear$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_mentions_text),
             ],
+            EDIT_NEW_HOURS: [
+                CallbackQueryHandler(edit_save_hours_quick, pattern=r"^hours:q:.+$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_hours_text),
+            ],
             ADMIN_ADD_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_save),
             ],
             TARGET_ADD_INPUT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, target_add_save),
             ],
+            PRESET_ASK_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, preset_name_text),
+            ],
+            PRESET_PICK_MEMBERS: [
+                CallbackQueryHandler(preset_pick_toggle, pattern=r"^prpick:t:\d+$"),
+                CallbackQueryHandler(preset_pick_done, pattern=r"^prpick:done$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, preset_pick_text),
+            ],
         },
         fallbacks=[
             CallbackQueryHandler(wiz_cancel, pattern=r"^wiz:cancel$"),
             CommandHandler("cancel", wiz_cancel),
             CommandHandler(["start", "help", "menu"], wiz_fallback_menu),
-            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:|tgtdel:|tgtrefresh)"),
+            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:|tgtdel:|tgtrefresh|presetdel:)"),
         ],
         allow_reentry=True,
         per_message=False,
@@ -2458,6 +3109,9 @@ def main() -> None:
     application.add_handler(wizard_handler)
     application.add_handler(CommandHandler(["start", "help", "menu"], cmd_menu))
     application.add_handler(CommandHandler(["targets", "target"], cmd_targets))
+    application.add_handler(CommandHandler(["presets", "preset"], cmd_presets))
+    application.add_handler(CommandHandler(["history", "riwayat"], cmd_history))
+    application.add_handler(CommandHandler("backup", cmd_backup))
     application.add_handler(CommandHandler(["admin", "admins"], cmd_admins))
     application.add_handler(CommandHandler("chatid", cmd_chatid))
     application.add_handler(CommandHandler(["schedule", "jadwalkan"], cmd_schedule))

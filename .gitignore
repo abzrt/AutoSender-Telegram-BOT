@@ -3,6 +3,8 @@
 admins.json
 groups.json
 members.json
+presets.json
+history.json
 php-cpanel/config.php
 php-cpanel/state.json
 php-cpanel/autosender.log

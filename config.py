@@ -175,6 +175,9 @@ class ScheduleJob:
     parse_mode: str | None = "HTML"
     photo: str | None = None
     mentions: list[str] = field(default_factory=list)
+    # Jam operasional opsional (contoh: active_hours="08:00-17:00", active_days=[1,2,3,4,5])
+    active_hours: str | None = None
+    active_days: list[int] | None = None
     # Date field (digunakan jika trigger == "date")
     run_at: str | None = None
     # Cron field (digunakan jika trigger == "cron")
@@ -246,6 +249,10 @@ class ScheduleJob:
             data["photo"] = self.photo
         if self.mentions:
             data["mentions"] = self.mentions
+        if self.active_hours:
+            data["active_hours"] = self.active_hours
+        if self.active_days:
+            data["active_days"] = self.active_days
         data["message"] = self.message
         return data
 
@@ -277,6 +284,14 @@ class BotConfig:
     @property
     def resolved_members_file(self) -> Path:
         return self.schedules_file.parent / "members.json"
+
+    @property
+    def resolved_presets_file(self) -> Path:
+        return self.schedules_file.parent / "presets.json"
+
+    @property
+    def resolved_history_file(self) -> Path:
+        return self.schedules_file.parent / "history.json"
 
 
 def load_config(env_path: str | Path | None = None, require_token: bool = True) -> BotConfig:
@@ -342,6 +357,8 @@ def load_schedules(path: str | Path) -> list[ScheduleJob]:
             parse_mode=item.get("parse_mode", "HTML"),
             photo=item.get("photo"),
             mentions=list(item.get("mentions", [])),
+            active_hours=item.get("active_hours"),
+            active_days=list(item["active_days"]) if item.get("active_days") else None,
             run_at=item.get("run_at"),
             cron=item.get("cron"),
             seconds=item.get("seconds"),
@@ -466,6 +483,148 @@ def save_known_members(path: str | Path, members: dict[str, dict[str, dict[str, 
     file_path.write_text(json.dumps(members, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_tag_presets(path: str | Path) -> dict[str, list[str]]:
+    """Muat daftar preset tim/shift tag dari presets.json."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(name): [str(t) for t in tags]
+        for name, tags in data.items()
+        if isinstance(tags, list) and tags
+    }
+
+
+def save_tag_presets(path: str | Path, presets: dict[str, list[str]]) -> None:
+    """Simpan daftar preset tim/shift tag ke presets.json."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps(presets, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_delivery_history(path: str | Path) -> list[dict[str, Any]]:
+    """Muat riwayat pengiriman dari history.json."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return []
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def append_delivery_history(path: str | Path, entry: dict[str, Any], max_items: int = 30) -> None:
+    """Tambahkan satu catatan pengiriman ke history.json (simpan maksimal max_items terakhir)."""
+    history = load_delivery_history(path)
+    history.insert(0, entry)
+    history = history[:max_items]
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps(history, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+DAY_NAME_MAP: dict[str, int] = {
+    "sen": 1, "senin": 1, "mon": 1,
+    "sel": 2, "selasa": 2, "tue": 2,
+    "rab": 3, "rabu": 3, "wed": 3,
+    "kam": 4, "kamis": 4, "thu": 4,
+    "jum": 5, "jumat": 5, "fri": 5,
+    "sab": 6, "sabtu": 6, "sat": 6,
+    "min": 7, "minggu": 7, "sun": 7,
+}
+DAY_LABELS: dict[int, str] = {
+    1: "Sen", 2: "Sel", 3: "Rab", 4: "Kam", 5: "Jum", 6: "Sab", 7: "Min",
+}
+
+
+def parse_active_window(raw: str) -> tuple[str | None, list[int] | None]:
+    """Parse input jam operasional, contoh:
+    - '24 jam' / 'off' / 'hapus' -> (None, None)
+    - '08:00-17:00' -> ('08:00-17:00', None)
+    - '08:00-17:00 sen-jum' -> ('08:00-17:00', [1,2,3,4,5])
+    - '08:00-17:00 sen,rab,jum' -> ('08:00-17:00', [1,3,5])
+    """
+    text = re.sub(r"\s+", " ", raw.strip().lower())
+    if text in ("24 jam", "24jam", "off", "hapus", "none", "bebas", "semua"):
+        return None, None
+
+    parts = text.split(" ", 1)
+    hour_part = parts[0]
+    m_hour = re.fullmatch(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", hour_part)
+    if not m_hour:
+        raise ValueError(
+            "Format jam operasional tidak valid. Contoh: '08:00-17:00', '08:00-17:00 sen-jum', atau '24 jam'."
+        )
+    sh, sm, eh, em = (int(m_hour.group(i)) for i in range(1, 5))
+    if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
+        raise ValueError("Jam harus antara 00:00 sampai 23:59.")
+    active_hours = f"{sh:02d}:{sm:02d}-{eh:02d}:{em:02d}"
+
+    active_days: list[int] | None = None
+    if len(parts) > 1 and parts[1].strip():
+        day_str = parts[1].strip()
+        if "-" in day_str and "," not in day_str:
+            a, b = [x.strip() for x in day_str.split("-", 1)]
+            if a not in DAY_NAME_MAP or b not in DAY_NAME_MAP:
+                raise ValueError("Nama hari tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+            da, db = DAY_NAME_MAP[a], DAY_NAME_MAP[b]
+            if da <= db:
+                active_days = list(range(da, db + 1))
+            else:
+                active_days = list(range(da, 8)) + list(range(1, db + 1))
+        else:
+            days_set: set[int] = set()
+            for tok in re.split(r"[\s,]+", day_str):
+                if not tok:
+                    continue
+                if tok not in DAY_NAME_MAP:
+                    raise ValueError(f"Hari '{tok}' tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+                days_set.add(DAY_NAME_MAP[tok])
+            active_days = sorted(days_set) if days_set else None
+
+    return active_hours, active_days
+
+
+def format_active_window(active_hours: str | None, active_days: list[int] | None) -> str:
+    if not active_hours and not active_days:
+        return "24 Jam (Setiap Hari)"
+    hours_part = active_hours or "00:00-23:59"
+    if not active_days or len(active_days) == 7:
+        return f"{hours_part} (Setiap Hari)"
+    if active_days == [1, 2, 3, 4, 5]:
+        return f"{hours_part} (Sen–Jum)"
+    days_label = ", ".join(DAY_LABELS.get(d, str(d)) for d in sorted(active_days))
+    return f"{hours_part} ({days_label})"
+
+
+def is_within_active_window(job: ScheduleJob, now: datetime) -> bool:
+    """Cek apakah waktu `now` berada di dalam jam & hari operasional jadwal."""
+    if job.active_days:
+        if now.isoweekday() not in job.active_days:
+            return False
+    if job.active_hours:
+        m = re.fullmatch(r"(\d{2}):(\d{2})-(\d{2}):(\d{2})", job.active_hours.strip())
+        if m:
+            start_min = int(m.group(1)) * 60 + int(m.group(2))
+            end_min = int(m.group(3)) * 60 + int(m.group(4))
+            cur_min = now.hour * 60 + now.minute
+            if start_min <= end_min:
+                if not (start_min <= cur_min <= end_min):
+                    return False
+            else:
+                # Lintas tengah malam (misal 22:00-06:00)
+                if not (cur_min >= start_min or cur_min <= end_min):
+                    return False
+    return True
+
+
 def parse_user_ids(raw: str) -> list[int]:
     """Parse daftar User ID Telegram (angka positif dipisah koma)."""
     parts = [p.strip() for p in raw.split(",") if p.strip()]
@@ -539,8 +698,9 @@ def render_message_with_mentions(
     mentions: list[str] | None = None,
     parse_mode: str | None = "HTML",
     saved_targets: dict[str, dict[str, str]] | None = None,
+    tag_presets: dict[str, list[str]] | None = None,
 ) -> str:
-    """Gabungkan daftar mentions dengan isi pesan, serta auto-resolve @Nama, @all/@semua, dan @[Nama](user_id)."""
+    """Gabungkan daftar mentions dengan isi pesan, serta auto-resolve @Nama, @NamaTim, @all/@semua, dan @[Nama](user_id)."""
     rendered = message
 
     # 1. Konversi inline @[Nama](123456789) -> HTML/Markdown mention link
@@ -553,13 +713,13 @@ def render_message_with_mentions(
 
     rendered = re.sub(r"@\[([^\]]+)\]\((\d+)\)", _replace_inline, rendered)
 
-    # 2. Bangun lookup dari user tersimpan (Kelola Target: type user/private)
-    if saved_targets:
+    # 2. Bangun lookup dari user tersimpan (Kelola Target) & preset tim
+    if saved_targets or tag_presets:
         alias_map: dict[str, str] = {}
         all_user_mentions: list[str] = []
         seen_all: set[str] = set()
 
-        for cid_str, info in saved_targets.items():
+        for cid_str, info in (saved_targets or {}).items():
             ttype = (info.get("type") or "").lower()
             if ttype not in ("user", "private"):
                 continue
@@ -578,13 +738,18 @@ def render_message_with_mentions(
                 all_user_mentions.append(mention_str)
 
             if title:
-                # Cocokkan nama penuh tanpa spasi (mis. @NasirQC) dan kata pertama (mis. @Nasir)
                 compact = re.sub(r"\s+", "", title).lower()
                 first_word = title.split()[0].lstrip("@").lower()
                 if compact:
                     alias_map.setdefault(compact, mention_str)
                 if first_word and len(first_word) >= 2:
                     alias_map.setdefault(first_word, mention_str)
+
+        for preset_name, preset_tokens in (tag_presets or {}).items():
+            compact_preset = re.sub(r"\s+", "", preset_name).lower()
+            if compact_preset and preset_tokens:
+                rendered_preset = " ".join(format_mention_token(t, parse_mode) for t in preset_tokens)
+                alias_map[compact_preset] = rendered_preset
 
         all_joined = " ".join(all_user_mentions)
 
@@ -597,7 +762,6 @@ def render_message_with_mentions(
                 return alias_map[key]
             return match.group(0)
 
-        # Hanya cocokkan @token yang bukan bagian dari email/URL/HTML attribute
         rendered = re.sub(r"(?<![A-Za-z0-9_./])@([A-Za-z0-9_]{2,64})", _replace_at_token, rendered)
 
     if mentions:
