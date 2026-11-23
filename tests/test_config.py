@@ -96,6 +96,20 @@ def test_mentions_parsing_and_rendering() -> None:
     assert rendered.startswith('@budi @ani <a href="tg://user?id=123456789">Budi</a>\n')
     assert '<a href="tg://user?id=987654">Siti</a>' in rendered
 
+    # Auto-resolve @Nama dan @all dari user yang disimpan di Kelola Target
+    saved = {
+        "172640153": {"title": "Nasir QC", "type": "user"},
+        "@budi_kerja": {"title": "Budi", "type": "user"},
+        "-1003977827975": {"title": "QC Assurance", "type": "supergroup"},
+    }
+    auto_msg = render_message_with_mentions("Tolong update @Nasir dan @Budi ya!", parse_mode="HTML", saved_targets=saved)
+    assert '<a href="tg://user?id=172640153">Nasir QC</a>' in auto_msg
+    assert "@budi_kerja" in auto_msg
+
+    all_msg = render_message_with_mentions("Cek @all sekarang!", parse_mode="HTML", saved_targets=saved)
+    assert '<a href="tg://user?id=172640153">Nasir QC</a>' in all_msg
+    assert "@budi_kerja" in all_msg
+
     with pytest.raises(ValueError, match="tidak valid"):
         parse_mentions("Budi:abc")
 

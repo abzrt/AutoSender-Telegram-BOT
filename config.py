@@ -538,11 +538,12 @@ def render_message_with_mentions(
     message: str,
     mentions: list[str] | None = None,
     parse_mode: str | None = "HTML",
+    saved_targets: dict[str, dict[str, str]] | None = None,
 ) -> str:
-    """Gabungkan daftar mentions dengan isi pesan serta konversi @[Nama](user_id) inline."""
+    """Gabungkan daftar mentions dengan isi pesan, serta auto-resolve @Nama, @all/@semua, dan @[Nama](user_id)."""
     rendered = message
 
-    # Konversi inline @[Nama](123456789) -> HTML/Markdown mention link
+    # 1. Konversi inline @[Nama](123456789) -> HTML/Markdown mention link
     def _replace_inline(match: re.Match[str]) -> str:
         label = match.group(1).strip()
         uid = match.group(2).strip()
@@ -551,6 +552,53 @@ def render_message_with_mentions(
         return f"[{label}](tg://user?id={uid})"
 
     rendered = re.sub(r"@\[([^\]]+)\]\((\d+)\)", _replace_inline, rendered)
+
+    # 2. Bangun lookup dari user tersimpan (Kelola Target: type user/private)
+    if saved_targets:
+        alias_map: dict[str, str] = {}
+        all_user_mentions: list[str] = []
+        seen_all: set[str] = set()
+
+        for cid_str, info in saved_targets.items():
+            ttype = (info.get("type") or "").lower()
+            if ttype not in ("user", "private"):
+                continue
+            title = (info.get("title") or "").strip()
+            if cid_str.startswith("@"):
+                mention_str = cid_str
+                alias_map[cid_str.lstrip("@").lower()] = mention_str
+            elif cid_str.lstrip("-").isdigit():
+                display = title or cid_str
+                mention_str = format_mention_token(f"{display}:{cid_str}", parse_mode)
+            else:
+                continue
+
+            if mention_str not in seen_all:
+                seen_all.add(mention_str)
+                all_user_mentions.append(mention_str)
+
+            if title:
+                # Cocokkan nama penuh tanpa spasi (mis. @NasirQC) dan kata pertama (mis. @Nasir)
+                compact = re.sub(r"\s+", "", title).lower()
+                first_word = title.split()[0].lstrip("@").lower()
+                if compact:
+                    alias_map.setdefault(compact, mention_str)
+                if first_word and len(first_word) >= 2:
+                    alias_map.setdefault(first_word, mention_str)
+
+        all_joined = " ".join(all_user_mentions)
+
+        def _replace_at_token(match: re.Match[str]) -> str:
+            token = match.group(1)
+            key = token.lower()
+            if key in ("all", "semua") and all_joined:
+                return all_joined
+            if key in alias_map:
+                return alias_map[key]
+            return match.group(0)
+
+        # Hanya cocokkan @token yang bukan bagian dari email/URL/HTML attribute
+        rendered = re.sub(r"(?<![A-Za-z0-9_./])@([A-Za-z0-9_]{2,64})", _replace_at_token, rendered)
 
     if mentions:
         tag_line = " ".join(format_mention_token(m, parse_mode) for m in mentions)

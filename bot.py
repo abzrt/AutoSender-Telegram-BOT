@@ -597,11 +597,20 @@ def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, Inli
     return text, keyboard
 
 
-async def send_scheduled_message(bot: Bot, job: ScheduleJob) -> tuple[int, int]:
+async def send_scheduled_message(
+    bot: Bot,
+    job: ScheduleJob,
+    saved_targets: dict[str, dict[str, str]] | None = None,
+) -> tuple[int, int]:
     """Kirim pesan dari satu ScheduleJob ke semua chat_ids."""
     success = 0
     failed = 0
-    final_text = render_message_with_mentions(job.message, job.mentions, job.parse_mode)
+    final_text = render_message_with_mentions(
+        job.message,
+        job.mentions,
+        job.parse_mode,
+        saved_targets=saved_targets,
+    )
 
     for chat_id in job.chat_ids:
         try:
@@ -644,6 +653,7 @@ def register_jobs(
     bot: Bot | None,
     jobs: list[ScheduleJob],
     config: BotConfig,
+    saved_targets: dict[str, dict[str, str]] | None = None,
 ) -> int:
     """Daftarkan ulang semua jadwal aktif ke scheduler."""
     scheduler.remove_all_jobs()
@@ -665,7 +675,7 @@ def register_jobs(
         scheduler.add_job(
             send_scheduled_message,
             trigger=trigger,
-            args=[bot, job],
+            args=[bot, job, saved_targets],
             id=job.id,
             name=job.name,
             replace_existing=True,
@@ -849,7 +859,7 @@ def save_new_custom_job(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
     return new_job
 
@@ -979,7 +989,7 @@ async def cmd_setpesan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     matched.message = new_text
     save_schedules(config.schedules_file, jobs)
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
 
     await update.message.reply_html(
@@ -1052,7 +1062,7 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await update.message.reply_html(f"🚀 Mengirim tes untuk job <code>{matched.id}</code>...")
-    success, failed = await send_scheduled_message(context.bot, matched)
+    success, failed = await send_scheduled_message(context.bot, matched, context.bot_data.get("known_groups"))
     await update.message.reply_html(
         f"Selesai tes <code>{matched.id}</code>: {success} terkirim, {failed} gagal.",
         reply_markup=build_back_menu_keyboard(),
@@ -1602,7 +1612,7 @@ async def _apply_edited_target(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
 
     keyboard = InlineKeyboardMarkup(
@@ -1778,7 +1788,7 @@ async def _apply_edited_mentions(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
 
     tags_label = " ".join(mentions) if mentions else "(kosong / dihapus)"
@@ -1820,7 +1830,7 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
 
     keyboard = InlineKeyboardMarkup(
@@ -1861,7 +1871,7 @@ async def _apply_edited_time(
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    register_jobs(scheduler, context.bot, jobs, config)
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"))
     context.bot_data["jobs"] = jobs
 
     msg = (
@@ -2211,7 +2221,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=build_back_menu_keyboard(),
             )
             return
-        success, failed = await send_scheduled_message(context.bot, matched)
+        success, failed = await send_scheduled_message(context.bot, matched, context.bot_data.get("known_groups"))
         await query.edit_message_text(
             f"🚀 Tes kirim <code>{matched.id}</code> selesai:\n"
             f"✅ Terkirim: <b>{success}</b> | ❌ Gagal: <b>{failed}</b>",
@@ -2275,7 +2285,7 @@ async def post_init(application: Application) -> None:
         save_known_groups(config.resolved_groups_file, known_groups)
 
     scheduler = AsyncIOScheduler(timezone=config.tzinfo)
-    register_jobs(scheduler, application.bot, jobs, config)
+    register_jobs(scheduler, application.bot, jobs, config, known_groups)
     scheduler.start()
 
     application.bot_data["scheduler"] = scheduler
