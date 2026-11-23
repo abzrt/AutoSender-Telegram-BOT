@@ -93,7 +93,7 @@ def test_mentions_parsing_and_rendering() -> None:
     assert tags == ["@budi", "@ani", "Budi:123456789"]
 
     rendered = render_message_with_mentions("Halo @[Siti](987654)!", tags, "HTML")
-    assert rendered.startswith('@budi @ani <a href="tg://user?id=123456789">Budi</a>\n')
+    assert rendered.endswith('\n\n@budi @ani <a href="tg://user?id=123456789">Budi</a>')
     assert '<a href="tg://user?id=987654">Siti</a>' in rendered
 
     # Auto-resolve @Nama dan @all dari user yang disimpan di Kelola Target

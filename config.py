@@ -602,6 +602,6 @@ def render_message_with_mentions(
 
     if mentions:
         tag_line = " ".join(format_mention_token(m, parse_mode) for m in mentions)
-        rendered = f"{tag_line}\n{rendered}" if rendered else tag_line
+        rendered = f"{rendered}\n\n{tag_line}" if rendered else tag_line
 
     return rendered
