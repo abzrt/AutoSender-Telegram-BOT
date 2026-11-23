@@ -1379,6 +1379,22 @@ async def wiz_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+async def wiz_fallback_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reset sesi wizard saat user mengirim /menu atau /start di tengah proses."""
+    context.user_data.pop("wiz", None)
+    context.user_data.pop("edit_job_id", None)
+    await cmd_menu(update, context)
+    return ConversationHandler.END
+
+
+async def wiz_fallback_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Reset sesi wizard saat user menekan tombol navigasi menu/tes/hapus di tengah proses."""
+    context.user_data.pop("wiz", None)
+    context.user_data.pop("edit_job_id", None)
+    await handle_menu_callback(update, context)
+    return ConversationHandler.END
+
+
 # ==================== CALLBACK MENU UMUM ====================
 
 
@@ -1711,7 +1727,10 @@ def main() -> None:
         fallbacks=[
             CallbackQueryHandler(wiz_cancel, pattern=r"^wiz:cancel$"),
             CommandHandler("cancel", wiz_cancel),
+            CommandHandler(["start", "help", "menu"], wiz_fallback_menu),
+            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:)"),
         ],
+        allow_reentry=True,
         per_message=False,
     )
 
