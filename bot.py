@@ -23,12 +23,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import TelegramError
+from telegram import Bot, BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import ChatMigrated, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -42,6 +43,7 @@ from config import (
     ensure_schedules_file,
     load_config,
     load_extra_admins,
+    load_known_groups,
     load_schedules,
     parse_flexible_schedule,
     parse_mentions,
@@ -49,6 +51,7 @@ from config import (
     parse_user_ids,
     render_message_with_mentions,
     save_extra_admins,
+    save_known_groups,
     save_schedules,
 )
 
@@ -181,6 +184,123 @@ def build_back_menu_keyboard() -> InlineKeyboardMarkup:
 
 def build_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")]])
+
+
+def build_target_picker_keyboard(
+    current_chat_id: int,
+    known_groups: dict[str, dict[str, str]],
+    selected_ids: list[int | str],
+    prefix: str = "wiztgt",
+) -> InlineKeyboardMarkup:
+    """Bangun keyboard checklist untuk memilih 1 atau banyak grup / chat target."""
+    selected_str = {str(x) for x in selected_ids}
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    # Tombol chat pribadi saat ini
+    cur_mark = "☑️" if str(current_chat_id) in selected_str else "⬜"
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                f"{cur_mark} 📍 Chat ini ({current_chat_id})",
+                callback_data=f"{prefix}:toggle:{current_chat_id}",
+            )
+        ]
+    )
+
+    # Daftar grup / channel yang diketahui bot (diurutkan sesuai nama)
+    sorted_groups = sorted(
+        known_groups.items(),
+        key=lambda kv: kv[1].get("title", "").lower(),
+    )
+    for cid_str, info in sorted_groups:
+        if cid_str == str(current_chat_id):
+            continue
+        title = info.get("title") or f"Grup {cid_str}"
+        if len(title) > 28:
+            title = title[:25] + "..."
+        icon = "📢" if info.get("type") == "channel" else "👥"
+        mark = "☑️" if cid_str in selected_str else "⬜"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{mark} {icon} {title}",
+                    callback_data=f"{prefix}:toggle:{cid_str}",
+                )
+            ]
+        )
+
+    # Tombol aksi bawah
+    action_row: list[InlineKeyboardButton] = []
+    if selected_ids:
+        action_row.append(
+            InlineKeyboardButton(
+                f"✅ Lanjut ({len(selected_ids)} dipilih)",
+                callback_data=f"{prefix}:done",
+            )
+        )
+    action_row.append(InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"))
+    buttons.append(action_row)
+    return InlineKeyboardMarkup(buttons)
+
+
+def remember_group(
+    bot_data: dict[str, Any],
+    chat_id: int,
+    title: str,
+    chat_type: str = "group",
+) -> None:
+    """Simpan atau perbarui grup/channel ke groups.json."""
+    config: BotConfig = bot_data["config"]
+    groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
+    key = str(chat_id)
+    new_entry = {"title": title or f"Grup {chat_id}", "type": chat_type}
+    if groups.get(key) != new_entry:
+        groups[key] = new_entry
+        save_known_groups(config.resolved_groups_file, groups)
+
+
+def forget_group(bot_data: dict[str, Any], chat_id: int) -> None:
+    """Hapus grup dari groups.json saat bot dikeluarkan."""
+    config: BotConfig = bot_data["config"]
+    groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
+    if groups.pop(str(chat_id), None) is not None:
+        save_known_groups(config.resolved_groups_file, groups)
+
+
+async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Otomatis catat/hapus grup saat bot ditambahkan atau dikeluarkan."""
+    member = update.my_chat_member
+    if not member or not member.chat:
+        return
+    chat = member.chat
+    if chat.type not in ("group", "supergroup", "channel"):
+        return
+
+    new_status = member.new_chat_member.status
+    if new_status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
+        remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
+        logger.info("Grup tercatat otomatis: %s (%s)", chat.title, chat.id)
+    elif new_status in (ChatMember.LEFT, ChatMember.BANNED):
+        forget_group(context.bot_data, chat.id)
+        logger.info("Grup dihapus dari daftar (bot keluar): %s (%s)", chat.title, chat.id)
+
+
+async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Otomatis catat nama grup saat ada pesan/aktivitas atau migrasi supergroup."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not chat or chat.type not in ("group", "supergroup", "channel"):
+        return
+
+    if msg and msg.migrate_to_chat_id:
+        old_id = chat.id
+        new_id = msg.migrate_to_chat_id
+        forget_group(context.bot_data, old_id)
+        remember_group(context.bot_data, new_id, chat.title or f"Grup {new_id}", "supergroup")
+        logger.info("Grup bermigrasi ke supergroup: %s -> %s", old_id, new_id)
+        return
+
+    remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
 
 
 def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -709,7 +829,7 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def wiz_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Langkah 1 (Buat Baru): Pilih target Chat ID."""
+    """Langkah 1 (Buat Baru): Pilih target grup/chat dari checklist atau ketik manual."""
     query = update.callback_query
     if not query:
         return ConversationHandler.END
@@ -722,33 +842,61 @@ async def wiz_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
     chat = update.effective_chat
     chat_id = chat.id if chat else 0
-    context.user_data.pop("wiz", None)
+    context.user_data["wiz"] = {"selected_ids": []}
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"📍 Kirim ke Chat ini ({chat_id})", callback_data=f"wiz:target:{chat_id}")],
-            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
-        ]
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    keyboard = build_target_picker_keyboard(chat_id, known_groups, [], prefix="wiztgt")
+    hint_groups = (
+        f"Tersedia <b>{len(known_groups)} grup</b> siap pilih."
+        if known_groups
+        else "<i>Belum ada grup terdeteksi (kirim 1 pesan di grup tempat bot berada agar muncul otomatis di sini).</i>"
     )
     await query.edit_message_text(
-        "<b>➕ Buat Pesan Custom Baru (1/4)</b>\n\n"
-        "Klik tombol di bawah untuk mengirim ke chat ini, atau <b>ketik Chat ID tujuan</b> "
-        "(boleh lebih dari satu dipisah koma, contoh: <code>217411824, -1001234567890</code>):",
+        "<b>➕ Buat Pesan Custom Baru (1/4) — Pilih Target</b>\n\n"
+        f"{hint_groups}\n\n"
+        "Centang 1 atau lebih grup/chat di bawah lalu klik <b>✅ Lanjut</b>, "
+        "atau langsung <b>ketik Chat ID manual</b> (pisah koma):",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
     return ASK_TARGET
 
 
-async def wiz_target_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def wiz_target_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query or not query.data:
         return ConversationHandler.END
     await query.answer()
 
-    target_id = int(query.data.split(":")[2])
-    context.user_data["wiz"] = {"chat_ids": [target_id]}
+    target_id = int(query.data.split(":", 2)[2])
+    wiz = context.user_data.setdefault("wiz", {})
+    selected: list[int | str] = list(wiz.get("selected_ids", []))
+    if target_id in selected:
+        selected.remove(target_id)
+    else:
+        selected.append(target_id)
+    wiz["selected_ids"] = selected
 
+    chat = update.effective_chat
+    chat_id = chat.id if chat else 0
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    keyboard = build_target_picker_keyboard(chat_id, known_groups, selected, prefix="wiztgt")
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return ASK_TARGET
+
+
+async def wiz_target_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    wiz = context.user_data.setdefault("wiz", {})
+    selected: list[int | str] = list(wiz.get("selected_ids", []))
+    if not selected:
+        await query.answer("Pilih minimal 1 grup atau chat terlebih dahulu!", show_alert=True)
+        return ASK_TARGET
+
+    await query.answer()
+    wiz["chat_ids"] = selected
     config: BotConfig = context.bot_data["config"]
     text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -1077,25 +1225,57 @@ async def edit_ask_target(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     target_id = context.user_data.get("edit_job_id", "")
     jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
     matched = next((j for j in jobs if j.id == target_id), None)
-    current_targets = matched.chat_ids if matched else []
+    current_targets: list[int | str] = list(matched.chat_ids) if matched else []
+    context.user_data["edit_selected_ids"] = list(current_targets)
+
     chat = update.effective_chat
     chat_id = chat.id if chat else 0
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    keyboard = build_target_picker_keyboard(chat_id, known_groups, current_targets, prefix="edittgt")
 
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(f"📍 Gunakan Chat ini ({chat_id})", callback_data=f"edittarget:{chat_id}")],
-            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
-        ]
-    )
     await query.edit_message_text(
         f"<b>🎯 Ubah Target Chat ID</b> (<code>{html.escape(target_id)}</code>)\n\n"
         f"Target saat ini: <code>{current_targets}</code>\n\n"
-        "Klik tombol di bawah untuk memakai chat ini, atau <b>ketik Chat ID baru</b> "
-        "(boleh lebih dari satu dipisah koma, contoh: <code>-1001234567890</code> atau <code>217411824, -1001234567890</code>):",
+        "Centang grup/chat tujuan di bawah lalu klik <b>✅ Lanjut</b>, "
+        "atau <b>ketik Chat ID baru</b> (pisah koma):",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
     return EDIT_NEW_TARGET
+
+
+async def edit_target_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    cid = int(query.data.split(":", 2)[2])
+    selected: list[int | str] = list(context.user_data.get("edit_selected_ids", []))
+    if cid in selected:
+        selected.remove(cid)
+    else:
+        selected.append(cid)
+    context.user_data["edit_selected_ids"] = selected
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else 0
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    keyboard = build_target_picker_keyboard(chat_id, known_groups, selected, prefix="edittgt")
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+    return EDIT_NEW_TARGET
+
+
+async def edit_target_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    selected: list[int | str] = list(context.user_data.pop("edit_selected_ids", []))
+    if not selected:
+        await query.answer("Pilih minimal 1 grup atau chat terlebih dahulu!", show_alert=True)
+        return EDIT_NEW_TARGET
+    await query.answer()
+    return await _apply_edited_target(update, context, selected)
 
 
 async def _apply_edited_target(
@@ -1579,6 +1759,35 @@ async def post_init(application: Application) -> None:
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
     extra_admins = load_extra_admins(config.resolved_admins_file)
+    known_groups = load_known_groups(config.resolved_groups_file)
+
+    # Otomatis ambil nama grup dari chat_ids negatif yang sudah ada di schedules.json
+    groups_updated = False
+    for job in jobs:
+        for cid in job.chat_ids:
+            if isinstance(cid, int) and cid < 0 and str(cid) not in known_groups:
+                try:
+                    chat_obj = await application.bot.get_chat(cid)
+                    known_groups[str(chat_obj.id)] = {
+                        "title": chat_obj.title or f"Grup {chat_obj.id}",
+                        "type": chat_obj.type,
+                    }
+                    groups_updated = True
+                except ChatMigrated as migrated:
+                    try:
+                        chat_obj = await application.bot.get_chat(migrated.new_chat_id)
+                        known_groups[str(chat_obj.id)] = {
+                            "title": chat_obj.title or f"Grup {chat_obj.id}",
+                            "type": chat_obj.type,
+                        }
+                        groups_updated = True
+                    except TelegramError:
+                        pass
+                except TelegramError:
+                    pass
+    if groups_updated:
+        save_known_groups(config.resolved_groups_file, known_groups)
+
     scheduler = AsyncIOScheduler(timezone=config.tzinfo)
     register_jobs(scheduler, application.bot, jobs, config)
     scheduler.start()
@@ -1586,6 +1795,7 @@ async def post_init(application: Application) -> None:
     application.bot_data["scheduler"] = scheduler
     application.bot_data["jobs"] = jobs
     application.bot_data["extra_admins"] = extra_admins
+    application.bot_data["known_groups"] = known_groups
 
     await application.bot.set_my_commands(
         [
@@ -1679,7 +1889,8 @@ def main() -> None:
         ],
         states={
             ASK_TARGET: [
-                CallbackQueryHandler(wiz_target_button, pattern=r"^wiz:target:-?\d+$"),
+                CallbackQueryHandler(wiz_target_toggle, pattern=r"^wiztgt:toggle:-?\d+$"),
+                CallbackQueryHandler(wiz_target_done, pattern=r"^wiztgt:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_target_text),
             ],
             ASK_DATETIME: [
@@ -1713,7 +1924,8 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_time_text),
             ],
             EDIT_NEW_TARGET: [
-                CallbackQueryHandler(edit_save_target_button, pattern=r"^edittarget:-?\d+$"),
+                CallbackQueryHandler(edit_target_toggle, pattern=r"^edittgt:toggle:-?\d+$"),
+                CallbackQueryHandler(edit_target_done, pattern=r"^edittgt:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_target_text),
             ],
             EDIT_NEW_MENTIONS: [
@@ -1733,6 +1945,10 @@ def main() -> None:
         allow_reentry=True,
         per_message=False,
     )
+
+    # Passive tracker grup/channel agar daftar grup selalu up-to-date otomatis
+    application.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER), group=-1)
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_activity), group=-1)
 
     application.add_handler(wizard_handler)
     application.add_handler(CommandHandler(["start", "help", "menu"], cmd_menu))

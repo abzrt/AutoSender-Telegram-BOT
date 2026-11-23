@@ -12,6 +12,7 @@ import pytest
 from bot import (
     build_custom_menu_keyboard,
     build_main_menu_keyboard,
+    build_target_picker_keyboard,
     build_trigger,
     get_all_admin_ids,
     parse_chat_ids,
@@ -21,14 +22,34 @@ from config import (
     ScheduleJob,
     load_config,
     load_extra_admins,
+    load_known_groups,
     load_schedules,
     parse_flexible_schedule,
     parse_mentions,
     parse_user_ids,
     render_message_with_mentions,
     save_extra_admins,
+    save_known_groups,
     save_schedules,
 )
+
+
+def test_known_groups_and_target_picker(tmp_path: Path) -> None:
+    groups_file = tmp_path / "groups.json"
+    sample = {
+        "-100111": {"title": "Grup Tim Alpha", "type": "supergroup"},
+        "-100222": {"title": "Channel Info", "type": "channel"},
+    }
+    save_known_groups(groups_file, sample)
+    loaded = load_known_groups(groups_file)
+    assert loaded == sample
+
+    markup = build_target_picker_keyboard(217411824, loaded, [-100111], prefix="wiztgt")
+    callbacks = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "wiztgt:toggle:217411824" in callbacks
+    assert "wiztgt:toggle:-100111" in callbacks
+    assert "wiztgt:toggle:-100222" in callbacks
+    assert "wiztgt:done" in callbacks
 
 
 def test_mentions_parsing_and_rendering() -> None:

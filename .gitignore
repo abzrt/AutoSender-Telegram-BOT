@@ -1,6 +1,7 @@
 # Rahasia & environment lokal (JANGAN pernah di-commit!)
 .env
 admins.json
+groups.json
 php-cpanel/config.php
 php-cpanel/state.json
 php-cpanel/autosender.log

@@ -270,6 +270,10 @@ class BotConfig:
             return self.admins_file
         return self.schedules_file.parent / "admins.json"
 
+    @property
+    def resolved_groups_file(self) -> Path:
+        return self.schedules_file.parent / "groups.json"
+
 
 def load_config(env_path: str | Path | None = None, require_token: bool = True) -> BotConfig:
     """Muat konfigurasi dari file .env dan environment variables."""
@@ -396,6 +400,34 @@ def save_extra_admins(path: str | Path, admin_ids: set[int]) -> None:
     file_path.parent.mkdir(parents=True, exist_ok=True)
     sorted_ids = sorted(admin_ids)
     file_path.write_text(json.dumps(sorted_ids, indent=2) + "\n", encoding="utf-8")
+
+
+def load_known_groups(path: str | Path) -> dict[str, dict[str, str]]:
+    """Muat daftar grup/channel yang diketahui bot dari groups.json."""
+    file_path = Path(path)
+    if not file_path.exists():
+        return {}
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for cid, info in data.items():
+        if isinstance(info, dict):
+            result[str(cid)] = {
+                "title": str(info.get("title") or f"Grup {cid}"),
+                "type": str(info.get("type") or "group"),
+            }
+    return result
+
+
+def save_known_groups(path: str | Path, groups: dict[str, dict[str, str]]) -> None:
+    """Simpan daftar grup/channel ke groups.json."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps(groups, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def parse_user_ids(raw: str) -> list[int]:
