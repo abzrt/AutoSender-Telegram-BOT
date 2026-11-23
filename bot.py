@@ -812,6 +812,92 @@ async def resolve_mention_usernames_for_chat(
     return uid_usernames, warnings
 
 
+async def send_self_preview_message(
+    bot: Bot,
+    self_chat_id: int,
+    message: str,
+    mentions: list[str] | None = None,
+    photo: str | None = None,
+    parse_mode: str | None = "HTML",
+    target_chat_ids: list[int | str] | None = None,
+    saved_targets: dict[str, dict[str, str]] | None = None,
+    tag_presets: dict[str, list[str]] | None = None,
+    config: BotConfig | None = None,
+) -> tuple[bool, str | None, list[str]]:
+    """Kirim preview hasil pesan custom langsung ke diri sendiri (chat pribadi admin)."""
+    uid_usernames: dict[str, str] = {}
+    warnings: list[str] = []
+
+    numeric_uids = extract_mention_user_ids(
+        message,
+        mentions=mentions,
+        saved_targets=saved_targets,
+        tag_presets=tag_presets,
+    )
+    if numeric_uids:
+        group_ids = [cid for cid in (target_chat_ids or []) if isinstance(cid, int) and cid < 0]
+        if group_ids:
+            for gid in group_ids:
+                resolved_map, w = await resolve_mention_usernames_for_chat(
+                    bot,
+                    gid,
+                    numeric_uids,
+                    saved_targets=saved_targets,
+                    config=config,
+                )
+                uid_usernames.update(resolved_map)
+                for item in w:
+                    if item not in warnings:
+                        warnings.append(item)
+        else:
+            resolved_map, _ = await resolve_mention_usernames_for_chat(
+                bot,
+                self_chat_id,
+                numeric_uids,
+                saved_targets=saved_targets,
+                config=config,
+            )
+            uid_usernames.update(resolved_map)
+
+    final_text = render_message_with_mentions(
+        message,
+        mentions,
+        parse_mode,
+        saved_targets=saved_targets,
+        tag_presets=tag_presets,
+        uid_usernames=uid_usernames,
+    )
+
+    try:
+        if photo:
+            photo_path = Path(photo)
+            if photo_path.exists() and photo_path.is_file():
+                with photo_path.open("rb") as photo_file:
+                    await bot.send_photo(
+                        chat_id=self_chat_id,
+                        photo=photo_file,
+                        caption=final_text or None,
+                        parse_mode=parse_mode,
+                    )
+            else:
+                await bot.send_photo(
+                    chat_id=self_chat_id,
+                    photo=photo,
+                    caption=final_text or None,
+                    parse_mode=parse_mode,
+                )
+        else:
+            await bot.send_message(
+                chat_id=self_chat_id,
+                text=final_text,
+                parse_mode=parse_mode,
+            )
+        return True, None, warnings
+    except TelegramError as exc:
+        logger.error("Gagal mengirim preview ke diri sendiri (%s): %s", self_chat_id, exc)
+        return False, str(exc), warnings
+
+
 async def send_scheduled_message(
     bot: Bot,
     job: ScheduleJob,
@@ -1097,6 +1183,7 @@ def format_jobs_list_and_keyboard(
             buttons.append(
                 [
                     InlineKeyboardButton(f"⚙️ Kelola {job.id}", callback_data=f"editpick:{job.id}"),
+                    InlineKeyboardButton("👤 Tes Diri", callback_data=f"job:testself:{job.id}"),
                     InlineKeyboardButton("🚀 Tes", callback_data=f"job:test:{job.id}"),
                     InlineKeyboardButton("🗑️ Hapus", callback_data=f"job:del:{job.id}"),
                 ]
@@ -1115,6 +1202,7 @@ def format_jobs_list_and_keyboard(
             buttons.append(
                 [
                     InlineKeyboardButton(f"⚙️ Kelola {ap_job.id}", callback_data=f"editpick:{ap_job.id}"),
+                    InlineKeyboardButton("👤 Tes Diri", callback_data=f"job:testself:{ap_job.id}"),
                     InlineKeyboardButton("🚀 Tes", callback_data=f"job:test:{ap_job.id}"),
                     InlineKeyboardButton("🗑️ Hapus", callback_data=f"job:del:{ap_job.id}"),
                 ]
@@ -1756,10 +1844,11 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
 
     keyboard = InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data="wiz:testself")],
             [
                 InlineKeyboardButton("✅ Simpan Jadwal", callback_data="wiz:save"),
                 InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
-            ]
+            ],
         ]
     )
     text = (
@@ -1769,12 +1858,57 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
         f"{photo_line}"
         f"🏷️ Tag: <code>{html.escape(tags_preview)}</code>\n"
         f"✉️ Pesan:\n{html.escape(custom_msg or '(tanpa teks)')}\n\n"
-        "Klik <b>✅ Simpan Jadwal</b> untuk mengaktifkan."
+        "Klik <b>👤 Tes ke Diri Sendiri</b> untuk melihat hasil jadinya dulu, atau <b>✅ Simpan Jadwal</b> untuk mengaktifkan."
     )
     if update.callback_query:
         await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     elif update.message:
         await update.message.reply_html(text, reply_markup=keyboard)
+    return CONFIRM_SAVE
+
+
+async def wiz_confirm_test_self(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Kirim preview pesan custom yang sedang dibuat ke diri sendiri tanpa keluar dari konfirmasi."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+
+    wiz = context.user_data.get("wiz")
+    if not wiz or "message" not in wiz:
+        await query.answer("Sesi pembuatan jadwal kedaluwarsa.", show_alert=True)
+        return ConversationHandler.END
+
+    user = update.effective_user
+    chat = update.effective_chat
+    self_chat_id = user.id if user else (chat.id if chat else 0)
+    if not self_chat_id:
+        await query.answer("Chat ID pribadi tidak ditemukan.", show_alert=True)
+        return CONFIRM_SAVE
+
+    config: BotConfig = context.bot_data["config"]
+    ok, err_msg, warnings = await send_self_preview_message(
+        context.bot,
+        self_chat_id=self_chat_id,
+        message=wiz["message"],
+        mentions=wiz.get("mentions", []),
+        photo=wiz.get("photo"),
+        parse_mode="HTML",
+        target_chat_ids=wiz.get("chat_ids", []),
+        saved_targets=context.bot_data.get("known_groups"),
+        tag_presets=context.bot_data.get("tag_presets"),
+        config=config,
+    )
+    if ok:
+        await query.answer("✅ Preview pesan terkirim ke chat kamu!", show_alert=False)
+        if warnings:
+            warn_lines = "\n".join(f"• {html.escape(w)}" for w in warnings[:5])
+            await context.bot.send_message(
+                chat_id=self_chat_id,
+                text=f"⚠️ <b>Catatan Preview Mention:</b>\n{warn_lines}",
+                parse_mode="HTML",
+            )
+    else:
+        await query.answer(f"Gagal kirim preview: {(err_msg or '')[:150]}", show_alert=True)
     return CONFIRM_SAVE
 
 
@@ -1802,7 +1936,10 @@ async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     tags_label = " ".join(mentions) if mentions else "-"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"🚀 Tes Kirim {new_job.id} Sekarang", callback_data=f"job:test:{new_job.id}")],
+            [
+                InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{new_job.id}"),
+                InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{new_job.id}"),
+            ],
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
@@ -1907,7 +2044,10 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 InlineKeyboardButton(toggle_label, callback_data="editact:toggle"),
             ],
             [
-                InlineKeyboardButton("🚀 Tes Kirim", callback_data=f"job:test:{matched.id}"),
+                InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
+                InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
+            ],
+            [
                 InlineKeyboardButton("❌ Tutup", callback_data="wiz:cancel"),
             ],
         ]
@@ -2170,7 +2310,10 @@ async def _apply_edited_target(
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"🚀 Tes Kirim {matched.id} Sekarang", callback_data=f"job:test:{matched.id}")],
+            [
+                InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
+                InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
+            ],
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
@@ -2354,7 +2497,10 @@ async def _apply_edited_mentions(
     tags_label = " ".join(mentions) if mentions else "(kosong / dihapus)"
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"🚀 Tes Kirim {matched.id} Sekarang", callback_data=f"job:test:{matched.id}")],
+            [
+                InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
+                InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
+            ],
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
@@ -2411,7 +2557,10 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     keyboard = InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"🚀 Tes Kirim {matched.id} Sekarang", callback_data=f"job:test:{matched.id}")],
+            [
+                InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
+                InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
+            ],
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
@@ -3045,6 +3194,49 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
+    if data.startswith("job:testself:"):
+        target_id = data.split(":", 2)[2]
+        jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+        matched = next((j for j in jobs if j.id == target_id), None)
+        if not matched:
+            await query.edit_message_text(
+                f"Job ID <code>{html.escape(target_id)}</code> tidak ditemukan.",
+                parse_mode="HTML",
+                reply_markup=build_back_menu_keyboard(),
+            )
+            return
+        user = update.effective_user
+        chat = update.effective_chat
+        self_chat_id = user.id if user else (chat.id if chat else 0)
+        if not self_chat_id:
+            return
+        ok, err_msg, warnings = await send_self_preview_message(
+            context.bot,
+            self_chat_id=self_chat_id,
+            message=matched.message,
+            mentions=matched.mentions,
+            photo=matched.photo,
+            parse_mode=matched.parse_mode,
+            target_chat_ids=matched.chat_ids,
+            saved_targets=context.bot_data.get("known_groups"),
+            tag_presets=context.bot_data.get("tag_presets"),
+            config=config,
+        )
+        if not ok:
+            await context.bot.send_message(
+                chat_id=self_chat_id,
+                text=f"❌ Gagal mengirim preview <code>{html.escape(matched.id)}</code>:\n<code>{html.escape(err_msg or 'Unknown error')}</code>",
+                parse_mode="HTML",
+            )
+        elif warnings:
+            warn_lines = "\n".join(f"• {html.escape(w)}" for w in warnings[:5])
+            await context.bot.send_message(
+                chat_id=self_chat_id,
+                text=f"⚠️ <b>Catatan Preview Mention ({html.escape(matched.id)}):</b>\n{warn_lines}",
+                parse_mode="HTML",
+            )
+        return
+
     if data.startswith("job:test:"):
         target_id = data.split(":", 2)[2]
         jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
@@ -3265,6 +3457,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_mentions_text),
             ],
             CONFIRM_SAVE: [
+                CallbackQueryHandler(wiz_confirm_test_self, pattern=r"^wiz:testself$"),
                 CallbackQueryHandler(wiz_confirm_save, pattern=r"^wiz:save$"),
             ],
             EDIT_SELECT_JOB: [

@@ -275,3 +275,47 @@ async def test_send_photo_and_quiet_hours_skip(tmp_path) -> None:
     assert fake_bot.send_photo.call_args.kwargs["photo"] == "AgACAgUAAxkBAAI_fake_file_id"
     assert fake_bot.send_photo.call_args.kwargs["caption"] == "SOP terbaru\n\n@budi_qc"
 
+
+@pytest.mark.anyio
+async def test_send_self_preview_message_and_button() -> None:
+    from types import SimpleNamespace
+    from bot import format_jobs_list_and_keyboard, send_self_preview_message
+
+    fake_bot = AsyncMock()
+    fake_bot.get_chat_member.return_value = SimpleNamespace(
+        status="member",
+        user=SimpleNamespace(id=101, username="agus_ok", first_name="Agus"),
+    )
+    saved_targets = {
+        "101": {"title": "Agus", "type": "user"},
+    }
+    ok, err, warnings = await send_self_preview_message(
+        fake_bot,
+        self_chat_id=217411824,
+        message="Tes pesan custom",
+        mentions=["Agus:101"],
+        target_chat_ids=[-1003977827975],
+        saved_targets=saved_targets,
+    )
+    assert ok is True
+    assert err is None
+    assert warnings == []
+    fake_bot.send_message.assert_called_once()
+    assert fake_bot.send_message.call_args.kwargs["chat_id"] == 217411824
+    assert fake_bot.send_message.call_args.kwargs["text"] == "Tes pesan custom\n\n@agus_ok"
+
+    # Pastikan tombol Tes Diri muncul di daftar jadwal
+    fake_scheduler = SimpleNamespace(get_jobs=lambda: [])
+    sample_job = ScheduleJob(
+        id="custom_1",
+        name="Pesan Custom",
+        trigger="interval",
+        minutes=30,
+        chat_ids=[-1003977827975],
+        message="Halo",
+    )
+    _, markup = format_jobs_list_and_keyboard(fake_scheduler, [sample_job])
+    cbs = [btn.callback_data for row in markup.inline_keyboard for btn in row]
+    assert "job:testself:custom_1" in cbs
+    assert "job:test:custom_1" in cbs
+
