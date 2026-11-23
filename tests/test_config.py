@@ -23,10 +23,24 @@ from config import (
     load_extra_admins,
     load_schedules,
     parse_flexible_schedule,
+    parse_mentions,
     parse_user_ids,
+    render_message_with_mentions,
     save_extra_admins,
     save_schedules,
 )
+
+
+def test_mentions_parsing_and_rendering() -> None:
+    tags = parse_mentions("@budi, ani Budi:123456789 @budi")
+    assert tags == ["@budi", "@ani", "Budi:123456789"]
+
+    rendered = render_message_with_mentions("Halo @[Siti](987654)!", tags, "HTML")
+    assert rendered.startswith('@budi @ani <a href="tg://user?id=123456789">Budi</a>\n')
+    assert '<a href="tg://user?id=987654">Siti</a>' in rendered
+
+    with pytest.raises(ValueError, match="tidak valid"):
+        parse_mentions("Budi:abc")
 
 
 def test_admin_persistence_and_parsing(tmp_path: Path) -> None:

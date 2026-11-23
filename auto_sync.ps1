@@ -49,7 +49,12 @@ function Invoke-SyncIfClean {
     git push origin main
 
     if ($LASTEXITCODE -eq 0) {
-        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] SUKSES di-push ke GitHub! Railway akan otomatis deploy." -ForegroundColor Green
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] SUKSES di-push ke GitHub!" -ForegroundColor Green
+        if (Get-Command railway.cmd -ErrorAction SilentlyContinue) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Memicu deploy terbaru di Railway..." -ForegroundColor Cyan
+            railway.cmd redeploy --from-source --yes | Out-Null
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Deploy Railway dipicu!" -ForegroundColor Green
+        }
     } else {
         Write-Host "[$(Get-Date -Format 'HH:mm:ss')] GAGAL push ke GitHub (cek koneksi/auth Git)." -ForegroundColor Red
     }

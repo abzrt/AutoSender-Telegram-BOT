@@ -44,8 +44,10 @@ from config import (
     load_extra_admins,
     load_schedules,
     parse_flexible_schedule,
+    parse_mentions,
     parse_run_at,
     parse_user_ids,
+    render_message_with_mentions,
     save_extra_admins,
     save_schedules,
 )
@@ -62,14 +64,16 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
     ASK_TARGET,
     ASK_DATETIME,
     ASK_MESSAGE,
+    ASK_MENTIONS,
     CONFIRM_SAVE,
     EDIT_SELECT_JOB,
     EDIT_ACTION,
     EDIT_NEW_MESSAGE,
     EDIT_NEW_TIME,
     EDIT_NEW_TARGET,
+    EDIT_NEW_MENTIONS,
     ADMIN_ADD_ID,
-) = range(10)
+) = range(12)
 
 
 def parse_chat_ids(raw: str) -> list[int | str]:
@@ -220,6 +224,7 @@ async def send_scheduled_message(bot: Bot, job: ScheduleJob) -> tuple[int, int]:
     """Kirim pesan dari satu ScheduleJob ke semua chat_ids."""
     success = 0
     failed = 0
+    final_text = render_message_with_mentions(job.message, job.mentions, job.parse_mode)
 
     for chat_id in job.chat_ids:
         try:
@@ -230,20 +235,20 @@ async def send_scheduled_message(bot: Bot, job: ScheduleJob) -> tuple[int, int]:
                         await bot.send_photo(
                             chat_id=chat_id,
                             photo=photo_file,
-                            caption=job.message or None,
+                            caption=final_text or None,
                             parse_mode=job.parse_mode,
                         )
                 else:
                     await bot.send_photo(
                         chat_id=chat_id,
                         photo=job.photo,
-                        caption=job.message or None,
+                        caption=final_text or None,
                         parse_mode=job.parse_mode,
                     )
             else:
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=job.message,
+                    text=final_text,
                     parse_mode=job.parse_mode,
                 )
             success += 1
@@ -430,6 +435,7 @@ def save_new_custom_job(
     chat_ids: list[int | str],
     spec: dict[str, Any],
     custom_msg: str,
+    mentions: list[str] | None = None,
 ) -> ScheduleJob:
     """Buat, simpan ke schedules.json, dan daftarkan jadwal custom baru."""
     config: BotConfig = context.bot_data["config"]
@@ -456,6 +462,7 @@ def save_new_custom_job(
         seconds=spec.get("seconds"),
         chat_ids=chat_ids,
         message=custom_msg,
+        mentions=list(mentions or []),
         enabled=True,
         parse_mode="HTML",
     )
@@ -724,7 +731,7 @@ async def wiz_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         ]
     )
     await query.edit_message_text(
-        "<b>➕ Buat Pesan Custom Baru (1/3)</b>\n\n"
+        "<b>➕ Buat Pesan Custom Baru (1/4)</b>\n\n"
         "Klik tombol di bawah untuk mengirim ke chat ini, atau <b>ketik Chat ID tujuan</b> "
         "(boleh lebih dari satu dipisah koma, contoh: <code>217411824, -1001234567890</code>):",
         parse_mode="HTML",
@@ -743,7 +750,7 @@ async def wiz_target_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.user_data["wiz"] = {"chat_ids": [target_id]}
 
     config: BotConfig = context.bot_data["config"]
-    text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/3)")
+    text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
     return ASK_DATETIME
 
@@ -760,7 +767,7 @@ async def wiz_target_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     context.user_data["wiz"] = {"chat_ids": chat_ids}
     config: BotConfig = context.bot_data["config"]
-    text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/3)")
+    text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await update.message.reply_html(text, reply_markup=keyboard)
     return ASK_DATETIME
 
@@ -777,10 +784,10 @@ async def wiz_datetime_quick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.setdefault("wiz", {})["spec"] = spec
 
     await query.edit_message_text(
-        "<b>✉️ Input Pesan Custom (3/3)</b>\n\n"
+        "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
         f"⏰ Waktu dipilih: <code>{html.escape(spec['label'])}</code>\n\n"
-        "Silakan ketik isi pesan custom yang ingin dikirim otomatis "
-        "(mendukung HTML seperti <code>&lt;b&gt;tebal&lt;/b&gt;</code>):",
+        "Silakan ketik isi pesan custom yang ingin dikirim otomatis.\n"
+        "<i>Tips: kamu juga bisa langsung tulis <code>@username</code> atau <code>@[Nama](UserID)</code> di dalam pesan!</i>",
         parse_mode="HTML",
         reply_markup=build_cancel_keyboard(),
     )
@@ -800,9 +807,10 @@ async def wiz_datetime_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     context.user_data.setdefault("wiz", {})["spec"] = spec
     await update.message.reply_html(
-        "<b>✉️ Input Pesan Custom (3/3)</b>\n\n"
+        "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
         f"⏰ Waktu dipilih: <code>{html.escape(spec['label'])}</code>\n\n"
-        "Silakan ketik isi pesan custom yang ingin dikirim otomatis:",
+        "Silakan ketik isi pesan custom yang ingin dikirim otomatis.\n"
+        "<i>Tips: boleh langsung tulis <code>@username</code> atau <code>@[Nama](UserID)</code> di dalam pesan!</i>",
         reply_markup=build_cancel_keyboard(),
     )
     return ASK_MESSAGE
@@ -819,8 +827,31 @@ async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     wiz = context.user_data.setdefault("wiz", {})
     wiz["message"] = custom_msg
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("⏭️ Lewati (Tanpa Tag Tambahan)", callback_data="wiz:mentions:skip")],
+            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
+        ]
+    )
+    await update.message.reply_html(
+        "<b>🏷️ Tag / Mention Username (4/4 — Opsional)</b>\n\n"
+        "Ketik username siapa saja yang ingin di-tag di atas pesan (pisahkan spasi atau koma):\n"
+        "• <b>Dengan username:</b> <code>@budi @ani @siti</code>\n"
+        "• <b>Tanpa username (pakai User ID):</b> <code>Budi:123456789</code>\n\n"
+        "Atau klik <b>⏭️ Lewati</b> jika tidak perlu tag tambahan.",
+        reply_markup=keyboard,
+    )
+    return ASK_MENTIONS
+
+
+async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    wiz = context.user_data.setdefault("wiz", {})
     spec: dict[str, Any] = wiz["spec"]
     chat_ids = wiz["chat_ids"]
+    custom_msg: str = wiz["message"]
+    mentions: list[str] = wiz.get("mentions", [])
+    tags_preview = " ".join(mentions) if mentions else "(tidak ada)"
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -830,15 +861,42 @@ async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             ]
         ]
     )
-    await update.message.reply_html(
+    text = (
         "<b>🔍 Konfirmasi Pesan Terjadwal</b>\n\n"
         f"🎯 Target: <code>{chat_ids}</code>\n"
         f"⏰ Waktu: <code>{html.escape(spec['label'])}</code>\n"
+        f"🏷️ Tag: <code>{html.escape(tags_preview)}</code>\n"
         f"✉️ Pesan:\n{html.escape(custom_msg)}\n\n"
-        "Klik <b>✅ Simpan Jadwal</b> untuk mengaktifkan.",
-        reply_markup=keyboard,
+        "Klik <b>✅ Simpan Jadwal</b> untuk mengaktifkan."
     )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_html(text, reply_markup=keyboard)
     return CONFIRM_SAVE
+
+
+async def wiz_mentions_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data.setdefault("wiz", {})["mentions"] = []
+    return await _show_wiz_confirmation(update, context)
+
+
+async def wiz_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return ASK_MENTIONS
+
+    try:
+        mentions = parse_mentions(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return ASK_MENTIONS
+
+    context.user_data.setdefault("wiz", {})["mentions"] = mentions
+    return await _show_wiz_confirmation(update, context)
 
 
 async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -858,8 +916,10 @@ async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     spec: dict[str, Any] = wiz["spec"]
     chat_ids: list[int | str] = wiz["chat_ids"]
     custom_msg: str = wiz["message"]
+    mentions: list[str] = wiz.get("mentions", [])
 
-    new_job = save_new_custom_job(context, chat_ids, spec, custom_msg)
+    new_job = save_new_custom_job(context, chat_ids, spec, custom_msg, mentions=mentions)
+    tags_label = " ".join(mentions) if mentions else "-"
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(f"🚀 Tes Kirim {new_job.id} Sekarang", callback_data=f"job:test:{new_job.id}")],
@@ -870,7 +930,8 @@ async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "<b>✅ Jadwal berhasil disimpan &amp; aktif!</b>\n\n"
         f"ID: <code>{new_job.id}</code>\n"
         f"⏰ Waktu: <code>{html.escape(spec['label'])}</code>\n"
-        f"🎯 Target: <code>{chat_ids}</code>",
+        f"🎯 Target: <code>{chat_ids}</code>\n"
+        f"🏷️ Tag: <code>{html.escape(tags_label)}</code>",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -945,6 +1006,7 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     context.user_data["edit_job_id"] = matched.id
+    tags_display = " ".join(matched.mentions) if matched.mentions else "(tidak ada)"
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -952,7 +1014,8 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 InlineKeyboardButton("⏰ Ubah Waktu", callback_data="editact:time"),
             ],
             [
-                InlineKeyboardButton("🎯 Ubah Target Chat ID", callback_data="editact:target"),
+                InlineKeyboardButton("🎯 Ubah Chat ID", callback_data="editact:target"),
+                InlineKeyboardButton("🏷️ Ubah Tag", callback_data="editact:mentions"),
             ],
             [
                 InlineKeyboardButton("🚀 Tes Kirim", callback_data=f"job:test:{matched.id}"),
@@ -964,6 +1027,7 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"<b>⚙️ Kelola Jadwal: {html.escape(matched.name)}</b> (<code>{matched.id}</code>)\n\n"
         f"⏰ <b>Waktu saat ini:</b> <code>{html.escape(describe_job_time(matched))}</code>\n"
         f"🎯 <b>Target:</b> <code>{matched.chat_ids}</code>\n"
+        f"🏷️ <b>Tag:</b> <code>{html.escape(tags_display)}</code>\n"
         f"✉️ <b>Pesan saat ini:</b>\n{html.escape(matched.message or '(kosong)')}\n\n"
         "Apa yang ingin kamu ubah?",
         parse_mode="HTML",
@@ -1099,6 +1163,101 @@ async def edit_save_target_text(update: Update, context: ContextTypes.DEFAULT_TY
         return EDIT_NEW_TARGET
 
     return await _apply_edited_target(update, context, chat_ids)
+
+
+async def edit_ask_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    current_tags = " ".join(matched.mentions) if (matched and matched.mentions) else "(tidak ada)"
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🧹 Hapus Semua Tag", callback_data="editmentions:clear")],
+            [InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")],
+        ]
+    )
+    await query.edit_message_text(
+        f"<b>🏷️ Ubah Tag / Mention</b> (<code>{html.escape(target_id)}</code>)\n\n"
+        f"Tag saat ini: <code>{html.escape(current_tags)}</code>\n\n"
+        "Ketik username baru yang ingin di-tag (pisahkan spasi atau koma):\n"
+        "• <code>@budi @ani</code>\n"
+        "• <code>Budi:123456789</code> (jika akun tidak punya username)",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+    return EDIT_NEW_MENTIONS
+
+
+async def _apply_edited_mentions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    mentions: list[str],
+) -> int:
+    target_id = context.user_data.pop("edit_job_id", None)
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+
+    if not matched:
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                "Sesi edit kedaluwarsa. Buka /menu lagi.",
+                reply_markup=build_main_menu_keyboard(),
+            )
+        elif update.message:
+            await update.message.reply_text("Sesi edit kedaluwarsa. Buka /menu lagi.", reply_markup=build_main_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.mentions = mentions
+    save_schedules(config.schedules_file, jobs)
+
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(scheduler, context.bot, jobs, config)
+    context.bot_data["jobs"] = jobs
+
+    tags_label = " ".join(mentions) if mentions else "(kosong / dihapus)"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"🚀 Tes Kirim {matched.id} Sekarang", callback_data=f"job:test:{matched.id}")],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
+        ]
+    )
+    msg = (
+        f"<b>✅ Tag / Mention untuk <code>{matched.id}</code> berhasil diperbarui!</b>\n\n"
+        f"🏷️ <b>Tag baru:</b> <code>{html.escape(tags_label)}</code>"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, parse_mode="HTML", reply_markup=keyboard)
+    elif update.message:
+        await update.message.reply_html(msg, reply_markup=keyboard)
+    return ConversationHandler.END
+
+
+async def edit_clear_mentions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+    return await _apply_edited_mentions(update, context, [])
+
+
+async def edit_save_mentions_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return EDIT_NEW_MENTIONS
+
+    try:
+        mentions = parse_mentions(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return EDIT_NEW_MENTIONS
+
+    return await _apply_edited_mentions(update, context, mentions)
 
 
 async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1514,6 +1673,10 @@ def main() -> None:
             ASK_MESSAGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_message_text),
             ],
+            ASK_MENTIONS: [
+                CallbackQueryHandler(wiz_mentions_skip, pattern=r"^wiz:mentions:skip$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_mentions_text),
+            ],
             CONFIRM_SAVE: [
                 CallbackQueryHandler(wiz_confirm_save, pattern=r"^wiz:save$"),
             ],
@@ -1524,6 +1687,7 @@ def main() -> None:
                 CallbackQueryHandler(edit_ask_message, pattern=r"^editact:msg$"),
                 CallbackQueryHandler(edit_ask_time, pattern=r"^editact:time$"),
                 CallbackQueryHandler(edit_ask_target, pattern=r"^editact:target$"),
+                CallbackQueryHandler(edit_ask_mentions, pattern=r"^editact:mentions$"),
             ],
             EDIT_NEW_MESSAGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_message),
@@ -1535,6 +1699,10 @@ def main() -> None:
             EDIT_NEW_TARGET: [
                 CallbackQueryHandler(edit_save_target_button, pattern=r"^edittarget:-?\d+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_target_text),
+            ],
+            EDIT_NEW_MENTIONS: [
+                CallbackQueryHandler(edit_clear_mentions, pattern=r"^editmentions:clear$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_mentions_text),
             ],
             ADMIN_ADD_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_save),

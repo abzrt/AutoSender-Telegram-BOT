@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -173,6 +174,7 @@ class ScheduleJob:
     enabled: bool = True
     parse_mode: str | None = "HTML"
     photo: str | None = None
+    mentions: list[str] = field(default_factory=list)
     # Date field (digunakan jika trigger == "date")
     run_at: str | None = None
     # Cron field (digunakan jika trigger == "cron")
@@ -242,6 +244,8 @@ class ScheduleJob:
             data["parse_mode"] = self.parse_mode
         if self.photo:
             data["photo"] = self.photo
+        if self.mentions:
+            data["mentions"] = self.mentions
         data["message"] = self.message
         return data
 
@@ -329,6 +333,7 @@ def load_schedules(path: str | Path) -> list[ScheduleJob]:
             enabled=bool(item.get("enabled", True)),
             parse_mode=item.get("parse_mode", "HTML"),
             photo=item.get("photo"),
+            mentions=list(item.get("mentions", [])),
             run_at=item.get("run_at"),
             cron=item.get("cron"),
             seconds=item.get("seconds"),
@@ -410,3 +415,77 @@ def parse_user_ids(raw: str) -> list[int]:
                 f"User ID '{part}' tidak valid. Masukkan angka User ID Telegram (contoh: 217411824)."
             ) from exc
     return result
+
+
+def parse_mentions(raw: str) -> list[str]:
+    """Parse daftar tag/mention dari input user.
+
+    Format yang didukung (dipisah koma atau spasi):
+    - '@username' atau 'username' -> '@username'
+    - 'Nama:123456789' -> 'Nama:123456789' (mention berdasarkan User ID)
+    """
+    tokens = [t.strip() for t in re.split(r"[\s,]+", raw.strip()) if t.strip()]
+    if not tokens:
+        raise ValueError("Daftar tag tidak boleh kosong.")
+
+    parsed: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if ":" in token:
+            label, uid_str = token.rsplit(":", 1)
+            label = label.strip().lstrip("@")
+            uid_str = uid_str.strip()
+            if not label or not uid_str.isdigit():
+                raise ValueError(
+                    f"Format tag ID '{token}' tidak valid. Gunakan 'Nama:UserID' (contoh: Budi:123456789)."
+                )
+            normalized = f"{label}:{uid_str}"
+        else:
+            uname = token.lstrip("@")
+            if not re.fullmatch(r"[A-Za-z0-9_]{3,64}", uname):
+                raise ValueError(
+                    f"Username '{token}' tidak valid. Gunakan huruf, angka, atau underscore (contoh: @budi_123)."
+                )
+            normalized = f"@{uname}"
+
+        key = normalized.lower()
+        if key not in seen:
+            seen.add(key)
+            parsed.append(normalized)
+
+    return parsed
+
+
+def format_mention_token(token: str, parse_mode: str | None = "HTML") -> str:
+    """Render satu token mention menjadi format siap kirim Telegram."""
+    if ":" in token:
+        label, uid_str = token.rsplit(":", 1)
+        if parse_mode and parse_mode.upper() == "HTML":
+            return f'<a href="tg://user?id={uid_str}">{html.escape(label)}</a>'
+        return f"[{label}](tg://user?id={uid_str})"
+    return token if token.startswith("@") else f"@{token}"
+
+
+def render_message_with_mentions(
+    message: str,
+    mentions: list[str] | None = None,
+    parse_mode: str | None = "HTML",
+) -> str:
+    """Gabungkan daftar mentions dengan isi pesan serta konversi @[Nama](user_id) inline."""
+    rendered = message
+
+    # Konversi inline @[Nama](123456789) -> HTML/Markdown mention link
+    def _replace_inline(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        uid = match.group(2).strip()
+        if parse_mode and parse_mode.upper() == "HTML":
+            return f'<a href="tg://user?id={uid}">{html.escape(label)}</a>'
+        return f"[{label}](tg://user?id={uid})"
+
+    rendered = re.sub(r"@\[([^\]]+)\]\((\d+)\)", _replace_inline, rendered)
+
+    if mentions:
+        tag_line = " ".join(format_mention_token(m, parse_mode) for m in mentions)
+        rendered = f"{tag_line}\n{rendered}" if rendered else tag_line
+
+    return rendered
