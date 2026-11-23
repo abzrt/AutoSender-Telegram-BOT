@@ -397,27 +397,34 @@ async def collect_mention_candidates(
     bot_data: dict[str, Any],
     chat_ids: list[int | str],
 ) -> list[dict[str, str]]:
-    """Kumpulkan daftar kandidat anggota yang bisa di-tag dari grup target + tag tersimpan."""
-    for cid in chat_ids:
-        if isinstance(cid, int) and cid < 0:
-            try:
-                admins = await bot.get_chat_administrators(cid)
-                for member in admins:
-                    remember_member_user(bot_data, cid, member.user)
-            except TelegramError:
-                pass
-
-    members: dict[str, dict[str, dict[str, str]]] = bot_data.get("known_members", {})
+    """Kumpulkan HANYA user yang disimpan sendiri di Kelola Target (👤 User) & tag manual tersimpan."""
     candidates: list[dict[str, str]] = []
     seen_tokens: set[str] = set()
 
-    scopes = [str(cid) for cid in chat_ids] + ["_saved"]
-    for scope in scopes:
-        for info in members.get(scope, {}).values():
-            token = info.get("token", "")
-            if token and token.lower() not in seen_tokens:
-                seen_tokens.add(token.lower())
-                candidates.append({"label": info.get("label") or token, "token": token})
+    # 1. Ambil user yang disimpan sendiri di Kelola Target (type == user / private)
+    known_groups: dict[str, dict[str, str]] = bot_data.get("known_groups", {})
+    for cid_str, info in known_groups.items():
+        ttype = (info.get("type") or "").lower()
+        if ttype not in ("user", "private"):
+            continue
+        title = (info.get("title") or cid_str).replace(":", " ").strip()
+        if cid_str.startswith("@"):
+            token = cid_str
+            label = f"{title} ({cid_str})" if title.lower() != cid_str.lower() else cid_str
+        else:
+            token = f"{title}:{cid_str}"
+            label = title
+        if token.lower() not in seen_tokens:
+            seen_tokens.add(token.lower())
+            candidates.append({"label": label, "token": token})
+
+    # 2. Ambil tag manual yang pernah diketik user sendiri (_saved)
+    members: dict[str, dict[str, dict[str, str]]] = bot_data.get("known_members", {})
+    for info in members.get("_saved", {}).values():
+        token = info.get("token", "")
+        if token and token.lower() not in seen_tokens:
+            seen_tokens.add(token.lower())
+            candidates.append({"label": info.get("label") or token, "token": token})
 
     candidates.sort(key=lambda item: item["label"].lower())
     return candidates[:24]
@@ -529,8 +536,6 @@ async def track_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYP
     new_status = member.new_chat_member.status
     if new_status in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
         remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
-    if update.effective_user:
-        remember_member_user(context.bot_data, chat.id, update.effective_user)
         logger.info("Grup tercatat otomatis: %s (%s)", chat.title, chat.id)
     elif new_status in (ChatMember.LEFT, ChatMember.BANNED):
         forget_group(context.bot_data, chat.id)
@@ -553,8 +558,6 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
-    if update.effective_user:
-        remember_member_user(context.bot_data, chat.id, update.effective_user)
 
 
 def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, InlineKeyboardMarkup]:
@@ -1243,9 +1246,9 @@ async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     wiz["mention_candidates"] = candidates
     keyboard = build_mentions_picker_keyboard(candidates, [], prefix="wiztag")
     hint = (
-        f"Tersedia <b>{len(candidates)} nama</b> yang siap dipilih."
+        f"Tersedia <b>{len(candidates)} user tersimpan</b> yang siap dipilih."
         if candidates
-        else "<i>Belum ada anggota tercatat — ketik username di bawah atau kirim pesan di grup agar otomatis muncul.</i>"
+        else "<i>Belum ada user tersimpan — tambahkan lewat 📇 Kelola Target (👤 User) atau ketik manual di bawah.</i>"
     )
     await update.message.reply_html(
         "<b>🏷️ Tag / Mention Username (4/4 — Opsional)</b>\n\n"
