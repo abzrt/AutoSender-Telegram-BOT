@@ -62,7 +62,7 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-autosender")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# State untuk ConversationHandler Custom Menu & Manajemen Admin
+# State untuk ConversationHandler Custom Menu, Target Book, & Manajemen Admin
 (
     ASK_TARGET,
     ASK_DATETIME,
@@ -76,7 +76,8 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
     EDIT_NEW_TARGET,
     EDIT_NEW_MENTIONS,
     ADMIN_ADD_ID,
-) = range(12)
+    TARGET_ADD_INPUT,
+) = range(13)
 
 
 def parse_chat_ids(raw: str) -> list[int | str]:
@@ -155,12 +156,13 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
-                InlineKeyboardButton("👑 Kelola Admin", callback_data="menu:admins"),
+                InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
             ],
             [
+                InlineKeyboardButton("👑 Kelola Admin", callback_data="menu:admins"),
                 InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
-                InlineKeyboardButton("🔄 Reload", callback_data="menu:reload"),
             ],
+            [InlineKeyboardButton("🔄 Reload schedules.json", callback_data="menu:reload")],
         ]
     )
 
@@ -186,13 +188,84 @@ def build_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel")]])
 
 
+def target_type_icon(target_type: str) -> str:
+    return {
+        "group": "👥",
+        "supergroup": "👥",
+        "user": "👤",
+        "private": "👤",
+        "channel": "📢",
+    }.get(target_type.lower(), "📌")
+
+
+def parse_single_target_id(raw: str) -> int | str:
+    val = raw.strip()
+    if val.startswith("@"):
+        return val
+    return int(val)
+
+
+def parse_target_entry(raw: str) -> tuple[str | None, int | str]:
+    """Parse input 'Nama | ID' atau hanya 'ID' / '@username'."""
+    text = raw.strip()
+    if not text:
+        raise ValueError("Input tidak boleh kosong.")
+    if "|" in text:
+        label_part, id_part = text.split("|", 1)
+        label = label_part.strip() or None
+        raw_id = id_part.strip()
+    else:
+        label = None
+        raw_id = text
+
+    parsed_ids = parse_chat_ids(raw_id)
+    if len(parsed_ids) != 1:
+        raise ValueError("Masukkan 1 target saja per kali tambah (contoh: `Grup Tim | -1001234567890`).")
+    return label, parsed_ids[0]
+
+
+def format_targets_menu(known_groups: dict[str, dict[str, str]]) -> tuple[str, InlineKeyboardMarkup]:
+    """Susun tampilan menu Kelola Target (Grup, User, Channel, Lainnya)."""
+    lines = ["<b>📇 Kelola Target (Grup / User / Channel / Lainnya)</b>\n"]
+    if known_groups:
+        sorted_items = sorted(known_groups.items(), key=lambda kv: (kv[1].get("type", ""), kv[1].get("title", "").lower()))
+        for cid_str, info in sorted_items:
+            icon = target_type_icon(info.get("type", "other"))
+            title = html.escape(info.get("title") or f"Target {cid_str}")
+            lines.append(f"• {icon} <b>{title}</b> (<code>{html.escape(cid_str)}</code>)")
+    else:
+        lines.append("<i>Belum ada target tersimpan. Tambahkan lewat tombol di bawah!</i>")
+
+    lines.append("\nPilih jenis target yang ingin ditambahkan:")
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton("➕ 👥 Grup", callback_data="tgtadd:group"),
+            InlineKeyboardButton("➕ 👤 User", callback_data="tgtadd:user"),
+        ],
+        [
+            InlineKeyboardButton("➕ 📢 Channel", callback_data="tgtadd:channel"),
+            InlineKeyboardButton("➕ 📌 Lainnya", callback_data="tgtadd:other"),
+        ],
+    ]
+
+    for cid_str, info in sorted(known_groups.items(), key=lambda kv: kv[1].get("title", "").lower()):
+        icon = target_type_icon(info.get("type", "other"))
+        title = info.get("title") or cid_str
+        if len(title) > 22:
+            title = title[:19] + "..."
+        buttons.append([InlineKeyboardButton(f"🗑️ Hapus {icon} {title}", callback_data=f"tgtdel:{cid_str}")])
+
+    buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
 def build_target_picker_keyboard(
     current_chat_id: int,
     known_groups: dict[str, dict[str, str]],
     selected_ids: list[int | str],
     prefix: str = "wiztgt",
 ) -> InlineKeyboardMarkup:
-    """Bangun keyboard checklist untuk memilih 1 atau banyak grup / chat target."""
+    """Bangun keyboard checklist untuk memilih 1 atau banyak grup / user / channel target."""
     selected_str = {str(x) for x in selected_ids}
     buttons: list[list[InlineKeyboardButton]] = []
 
@@ -207,7 +280,7 @@ def build_target_picker_keyboard(
         ]
     )
 
-    # Daftar grup / channel yang diketahui bot (diurutkan sesuai nama)
+    # Daftar grup / user / channel yang tersimpan (diurutkan sesuai nama)
     sorted_groups = sorted(
         known_groups.items(),
         key=lambda kv: kv[1].get("title", "").lower(),
@@ -215,10 +288,10 @@ def build_target_picker_keyboard(
     for cid_str, info in sorted_groups:
         if cid_str == str(current_chat_id):
             continue
-        title = info.get("title") or f"Grup {cid_str}"
+        title = info.get("title") or f"Target {cid_str}"
         if len(title) > 28:
             title = title[:25] + "..."
-        icon = "📢" if info.get("type") == "channel" else "👥"
+        icon = target_type_icon(info.get("type", "group"))
         mark = "☑️" if cid_str in selected_str else "⬜"
         buttons.append(
             [
@@ -245,22 +318,22 @@ def build_target_picker_keyboard(
 
 def remember_group(
     bot_data: dict[str, Any],
-    chat_id: int,
+    chat_id: int | str,
     title: str,
     chat_type: str = "group",
 ) -> None:
-    """Simpan atau perbarui grup/channel ke groups.json."""
+    """Simpan atau perbarui target (grup/user/channel/lainnya) ke groups.json."""
     config: BotConfig = bot_data["config"]
     groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
     key = str(chat_id)
-    new_entry = {"title": title or f"Grup {chat_id}", "type": chat_type}
+    new_entry = {"title": title or f"Target {chat_id}", "type": chat_type}
     if groups.get(key) != new_entry:
         groups[key] = new_entry
         save_known_groups(config.resolved_groups_file, groups)
 
 
-def forget_group(bot_data: dict[str, Any], chat_id: int) -> None:
-    """Hapus grup dari groups.json saat bot dikeluarkan."""
+def forget_group(bot_data: dict[str, Any], chat_id: int | str) -> None:
+    """Hapus target dari groups.json."""
     config: BotConfig = bot_data["config"]
     groups: dict[str, dict[str, str]] = bot_data.setdefault("known_groups", {})
     if groups.pop(str(chat_id), None) is not None:
@@ -868,7 +941,7 @@ async def wiz_target_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
     await query.answer()
 
-    target_id = int(query.data.split(":", 2)[2])
+    target_id = parse_single_target_id(query.data.split(":", 2)[2])
     wiz = context.user_data.setdefault("wiz", {})
     selected: list[int | str] = list(wiz.get("selected_ids", []))
     if target_id in selected:
@@ -1250,7 +1323,7 @@ async def edit_target_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
     await query.answer()
 
-    cid = int(query.data.split(":", 2)[2])
+    cid = parse_single_target_id(query.data.split(":", 2)[2])
     selected: list[int | str] = list(context.user_data.get("edit_selected_ids", []))
     if cid in selected:
         selected.remove(cid)
@@ -1578,6 +1651,90 @@ async def wiz_fallback_callback(update: Update, context: ContextTypes.DEFAULT_TY
 # ==================== CALLBACK MENU UMUM ====================
 
 
+async def target_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Mulai input target baru (Grup / User / Channel / Lainnya)."""
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+    await query.answer()
+
+    target_type = query.data.split(":", 1)[1]
+    context.user_data["target_add_type"] = target_type
+
+    hints = {
+        "group": ("👥 Tambah ID Grup", "<code>-1001234567890</code> atau <code>Grup Kantor | -1001234567890</code>"),
+        "user": ("👤 Tambah ID User", "<code>217411824</code> atau <code>Budi | 217411824</code>"),
+        "channel": ("📢 Tambah ID / Username Channel", "<code>@namachannel</code>, <code>-1001234567890</code>, atau <code>Info Promo | @namachannel</code>"),
+        "other": ("📌 Tambah Target Lainnya", "<code>Nama Bebas | ID_atau_@username</code>"),
+    }
+    title, example = hints.get(target_type, hints["other"])
+
+    await query.edit_message_text(
+        f"<b>{title}</b>\n\n"
+        f"Ketik ID target (atau <code>Nama | ID</code>):\n"
+        f"Contoh: {example}\n\n"
+        "<i>Tips: Jika tidak menulis nama, bot otomatis mengambil nama aslinya dari Telegram jika terjangkau.</i>",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    return TARGET_ADD_INPUT
+
+
+async def target_add_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return TARGET_ADD_INPUT
+
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+
+    try:
+        custom_label, target_id = parse_target_entry(update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
+        return TARGET_ADD_INPUT
+
+    target_type = str(context.user_data.pop("target_add_type", "other"))
+    resolved_title = custom_label
+
+    if not resolved_title:
+        try:
+            chat_obj = await context.bot.get_chat(target_id)
+            resolved_title = chat_obj.title or chat_obj.full_name or chat_obj.username or str(target_id)
+            if target_type == "other" and chat_obj.type:
+                target_type = chat_obj.type
+        except TelegramError:
+            resolved_title = str(target_id)
+
+    remember_group(context.bot_data, target_id, resolved_title, target_type)
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    text, markup = format_targets_menu(known_groups)
+
+    await update.message.reply_html(
+        f"<b>✅ Target tersimpan!</b> {target_type_icon(target_type)} "
+        f"<b>{html.escape(resolved_title)}</b> (<code>{html.escape(str(target_id))}</code>)\n\n{text}",
+        reply_markup=markup,
+    )
+    return ConversationHandler.END
+
+
+async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+    text, markup = format_targets_menu(known_groups)
+    await update.message.reply_html(text, reply_markup=markup)
+
+
 async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query:
@@ -1644,6 +1801,24 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:home":
         text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
+        return
+
+    if data == "menu:targets":
+        known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+        text, markup = format_targets_menu(known_groups)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    if data.startswith("tgtdel:"):
+        cid_str = data.split(":", 1)[1]
+        forget_group(context.bot_data, cid_str)
+        known_groups = context.bot_data.get("known_groups", {})
+        text, markup = format_targets_menu(known_groups)
+        await query.edit_message_text(
+            f"🗑️ Target <code>{html.escape(cid_str)}</code> dihapus.\n\n{text}",
+            parse_mode="HTML",
+            reply_markup=markup,
+        )
         return
 
     if data == "menu:admins":
@@ -1800,6 +1975,7 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("menu", "Buka menu utama interaktif"),
+            BotCommand("targets", "Kelola ID Grup/User/Channel"),
             BotCommand("admin", "Kelola daftar admin bot"),
             BotCommand("schedule", "Buat jadwal pesan cepat"),
             BotCommand("setpesan", "Ubah custom pesan jadwal"),
@@ -1886,10 +2062,11 @@ def main() -> None:
             CallbackQueryHandler(edit_list_jobs, pattern=r"^custom:edit$"),
             CallbackQueryHandler(edit_show_actions, pattern=r"^editpick:.+$"),
             CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"),
+            CallbackQueryHandler(target_add_start, pattern=r"^tgtadd:.+$"),
         ],
         states={
             ASK_TARGET: [
-                CallbackQueryHandler(wiz_target_toggle, pattern=r"^wiztgt:toggle:-?\d+$"),
+                CallbackQueryHandler(wiz_target_toggle, pattern=r"^wiztgt:toggle:.+$"),
                 CallbackQueryHandler(wiz_target_done, pattern=r"^wiztgt:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_target_text),
             ],
@@ -1924,7 +2101,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_time_text),
             ],
             EDIT_NEW_TARGET: [
-                CallbackQueryHandler(edit_target_toggle, pattern=r"^edittgt:toggle:-?\d+$"),
+                CallbackQueryHandler(edit_target_toggle, pattern=r"^edittgt:toggle:.+$"),
                 CallbackQueryHandler(edit_target_done, pattern=r"^edittgt:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_target_text),
             ],
@@ -1935,12 +2112,15 @@ def main() -> None:
             ADMIN_ADD_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_save),
             ],
+            TARGET_ADD_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, target_add_save),
+            ],
         },
         fallbacks=[
             CallbackQueryHandler(wiz_cancel, pattern=r"^wiz:cancel$"),
             CommandHandler("cancel", wiz_cancel),
             CommandHandler(["start", "help", "menu"], wiz_fallback_menu),
-            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:)"),
+            CallbackQueryHandler(wiz_fallback_callback, pattern=r"^(menu:|job:|admin:del:|tgtdel:)"),
         ],
         allow_reentry=True,
         per_message=False,
@@ -1952,6 +2132,7 @@ def main() -> None:
 
     application.add_handler(wizard_handler)
     application.add_handler(CommandHandler(["start", "help", "menu"], cmd_menu))
+    application.add_handler(CommandHandler(["targets", "target"], cmd_targets))
     application.add_handler(CommandHandler(["admin", "admins"], cmd_admins))
     application.add_handler(CommandHandler("chatid", cmd_chatid))
     application.add_handler(CommandHandler(["schedule", "jadwalkan"], cmd_schedule))

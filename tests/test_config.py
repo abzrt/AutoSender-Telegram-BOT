@@ -14,8 +14,10 @@ from bot import (
     build_main_menu_keyboard,
     build_target_picker_keyboard,
     build_trigger,
+    format_targets_menu,
     get_all_admin_ids,
     parse_chat_ids,
+    parse_target_entry,
 )
 from config import (
     BotConfig,
@@ -50,6 +52,15 @@ def test_known_groups_and_target_picker(tmp_path: Path) -> None:
     assert "wiztgt:toggle:-100111" in callbacks
     assert "wiztgt:toggle:-100222" in callbacks
     assert "wiztgt:done" in callbacks
+
+    assert parse_target_entry("Grup Tim | -1003977827975") == ("Grup Tim", -1003977827975)
+    assert parse_target_entry("@mychannel") == (None, "@mychannel")
+    _, targets_markup = format_targets_menu(loaded)
+    target_cbs = [btn.callback_data for row in targets_markup.inline_keyboard for btn in row]
+    assert "tgtadd:group" in target_cbs
+    assert "tgtadd:user" in target_cbs
+    assert "tgtadd:channel" in target_cbs
+    assert "tgtadd:other" in target_cbs
 
 
 def test_mentions_parsing_and_rendering() -> None:
@@ -98,6 +109,7 @@ def test_main_and_custom_menu_keyboards() -> None:
     main_callbacks = [btn.callback_data for row in build_main_menu_keyboard().inline_keyboard for btn in row]
     assert "menu:custom" in main_callbacks
     assert "menu:list" in main_callbacks
+    assert "menu:targets" in main_callbacks
     assert "menu:admins" in main_callbacks
     assert "menu:chatid" in main_callbacks
     assert "menu:reload" in main_callbacks
