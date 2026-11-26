@@ -570,7 +570,7 @@ def build_active_hours_prompt(job_id: str, current_label: str) -> tuple[str, Inl
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🏢 Jam Kerja (08:00-17:00 Sen-Jum)", callback_data="hours:q:08:00-17:00 sen-jum")],
-            [InlineKeyboardButton("☀️ Harian (08:00-21:00 Setiap Hari)", callback_data="hours:q:08:00-21:00")],
+            [InlineKeyboardButton("☀️ Harian (08:00-21:00 Setiap Hari)", callback_data="hours:q:08:00-21:00 semua")],
             [
                 InlineKeyboardButton("🌐 24 Jam (Tanpa Batas)", callback_data="hours:q:24 jam"),
                 InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
@@ -784,9 +784,6 @@ def build_minute_schedule_prompt(title: str) -> tuple[str, InlineKeyboardMarkup]
                 InlineKeyboardButton("Setiap 45 Menit", callback_data="time:quick:setiap 45 menit"),
             ],
             [
-                InlineKeyboardButton("📅 Per Menit di Hari Tertentu", callback_data="time:mode:days"),
-            ],
-            [
                 InlineKeyboardButton("⬅️ Kembali", callback_data="time:mode:back"),
                 InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
             ],
@@ -815,9 +812,6 @@ def build_hour_schedule_prompt(title: str) -> tuple[str, InlineKeyboardMarkup]:
             [
                 InlineKeyboardButton("Setiap 6 Jam", callback_data="time:quick:setiap 6 jam"),
                 InlineKeyboardButton("Setiap 12 Jam", callback_data="time:quick:setiap 12 jam"),
-            ],
-            [
-                InlineKeyboardButton("📅 Per Jam di Hari Tertentu", callback_data="time:mode:days"),
             ],
             [
                 InlineKeyboardButton("⬅️ Kembali", callback_data="time:mode:back"),
@@ -2434,6 +2428,7 @@ async def _apply_edited_hours(
     context: ContextTypes.DEFAULT_TYPE,
     active_hours: str | None,
     active_days: list[int] | None,
+    raw_expr: str | None = None,
 ) -> int:
     target_id = context.user_data.pop("edit_job_id", None)
     config: BotConfig = context.bot_data["config"]
@@ -2446,8 +2441,14 @@ async def _apply_edited_hours(
             await update.message.reply_text("Sesi edit kedaluwarsa.", reply_markup=build_main_menu_keyboard())
         return ConversationHandler.END
 
-    matched.active_hours = active_hours
-    matched.active_days = active_days
+    # Pertahankan field yang tidak disebut saat user hanya mengubah jam saja atau hari saja
+    if active_hours is None and active_days is not None:
+        matched.active_days = active_days
+    elif active_hours is not None and active_days is None and raw_expr and len(raw_expr.strip().split()) == 1:
+        matched.active_hours = active_hours
+    else:
+        matched.active_hours = active_hours
+        matched.active_days = active_days
     save_schedules(config.schedules_file, jobs)
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
     register_jobs(
@@ -2460,7 +2461,7 @@ async def _apply_edited_hours(
     )
     context.bot_data["jobs"] = jobs
 
-    label = format_active_window(active_hours, active_days)
+    label = format_active_window(matched.active_hours, matched.active_days)
     msg = (
         f"<b>✅ Jam operasional untuk <code>{matched.id}</code> diperbarui!</b>\n\n"
         f"🕒 <b>Jam Aktif:</b> <code>{html.escape(label)}</code>"
@@ -2479,7 +2480,7 @@ async def edit_save_hours_quick(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     expr = query.data.split(":", 2)[2]
     ah, ad = parse_active_window(expr)
-    return await _apply_edited_hours(update, context, ah, ad)
+    return await _apply_edited_hours(update, context, ah, ad, raw_expr=expr)
 
 
 async def edit_save_hours_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2490,7 +2491,7 @@ async def edit_save_hours_text(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError as exc:
         await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
         return EDIT_NEW_HOURS
-    return await _apply_edited_hours(update, context, ah, ad)
+    return await _apply_edited_hours(update, context, ah, ad, raw_expr=update.message.text)
 
 
 async def edit_ask_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

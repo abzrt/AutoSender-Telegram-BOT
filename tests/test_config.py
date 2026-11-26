@@ -383,10 +383,20 @@ def test_per_minute_per_hour_and_per_day_schedules() -> None:
     s_days = parse_flexible_schedule("sen,rab,jum 08:30", tz, now=fixed_now)
     assert s_days["trigger"] == "cron"
     assert s_days["cron"] == "30 8 * * mon,wed,fri"
+    assert s_days["active_days"] is None
 
     s_days_rev = parse_flexible_schedule("09:00 sen-jum", tz, now=fixed_now)
     assert s_days_rev["trigger"] == "cron"
     assert s_days_rev["cron"] == "0 9 * * mon,tue,wed,thu,fri"
+
+    # Pastikan "setiap hari senin 08:00" & "per hari 08:00" tidak tertangkap aturan interval
+    s_hari_sen = parse_flexible_schedule("setiap hari senin 08:00", tz, now=fixed_now)
+    assert s_hari_sen["trigger"] == "cron"
+    assert s_hari_sen["cron"] == "0 8 * * mon"
+
+    s_per_hari = parse_flexible_schedule("per hari 08:00", tz, now=fixed_now)
+    assert s_per_hari["trigger"] == "cron"
+    assert s_per_hari["cron"] == "0 8 * * *"
 
     # Pastikan APScheduler CronTrigger valid dengan day_of_week nama hari
     cron_job = ScheduleJob(
@@ -409,10 +419,16 @@ def test_per_minute_per_hour_and_per_day_schedules() -> None:
     assert cron_job.minutes == 15
     assert cron_job.active_days == [1, 3, 5]
 
-    # parse_active_window mendukung hari saja
-    assert parse_active_window("sen,rab,jum") == (None, [1, 3, 5])
+    # Mengubah kembali ke cron hari tertentu mereset active_days lama agar tidak saling blokir
+    apply_schedule_spec(cron_job, s_days)
+    assert cron_job.trigger == "cron"
+    assert cron_job.active_days is None
 
-    # Menu tombol interaktif untuk per menit, per jam, dan pilih hari
+    # parse_active_window mendukung hari saja dan "semua"
+    assert parse_active_window("sen,rab,jum") == (None, [1, 3, 5])
+    assert parse_active_window("08:00-21:00 semua") == ("08:00-21:00", None)
+
+    # Menu tombol interaktif untuk per menit, per jam, dan pilih hari (tanpa tombol duplikat)
     cfg = BotConfig(bot_token="dummy")
     _, main_time_kb = build_flexible_time_prompt(cfg, "Test")
     main_cbs = [b.callback_data for row in main_time_kb.inline_keyboard for b in row]
@@ -424,11 +440,13 @@ def test_per_minute_per_hour_and_per_day_schedules() -> None:
     min_cbs = [b.callback_data for row in min_kb.inline_keyboard for b in row]
     assert "time:quick:setiap 1 menit" in min_cbs
     assert "time:quick:setiap 15 menit" in min_cbs
+    assert "time:mode:days" not in min_cbs
 
     _, hr_kb = build_hour_schedule_prompt("Test")
     hr_cbs = [b.callback_data for row in hr_kb.inline_keyboard for b in row]
     assert "time:quick:setiap 1 jam" in hr_cbs
     assert "time:quick:setiap 6 jam" in hr_cbs
+    assert "time:mode:days" not in hr_cbs
 
     _, day_kb = build_day_picker_prompt("Test", [1, 3, 5])
     day_cbs = [b.callback_data for row in day_kb.inline_keyboard for b in row]

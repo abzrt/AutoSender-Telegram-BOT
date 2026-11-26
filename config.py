@@ -54,8 +54,8 @@ def parse_flexible_schedule(raw: str, tz: ZoneInfo, now: datetime | None = None)
     lower = text.lower()
     current = now or datetime.now(tz)
 
-    # 1. Harian berulang: "setiap hari 08:00" / "harian 08:00" / "tiap hari 08:00"
-    m_daily = re.fullmatch(r"(?:setiap\s+hari|tiap\s+hari|harian)\s+(\d{1,2}):(\d{2})", lower)
+    # 1. Harian berulang: "setiap hari 08:00" / "harian 08:00" / "tiap hari 08:00" / "per hari 08:00"
+    m_daily = re.fullmatch(r"(?:setiap\s+hari|tiap\s+hari|per\s+hari|harian)\s+(\d{1,2}):(\d{2})", lower)
     if m_daily:
         hour, minute = int(m_daily.group(1)), int(m_daily.group(2))
         if not (0 <= hour <= 23 and 0 <= minute <= 59):
@@ -63,8 +63,42 @@ def parse_flexible_schedule(raw: str, tz: ZoneInfo, now: datetime | None = None)
         return {
             "trigger": "cron",
             "cron": f"{minute} {hour} * * *",
+            "active_days": None,
             "label": f"Setiap hari pukul {hour:02d}:{minute:02d} {current.tzname()}",
         }
+
+    # 1b. Hari tertentu + jam spesifik (cek sebelum interval agar "setiap hari senin 08:00" tidak tertangkap interval):
+    #     "senin 08:00", "setiap hari senin 08:00", "sen,rab,jum 08:00", "setiap sen-jum 09:30", "08:00 sen-jum"
+    m_days_time = re.fullmatch(r"(.+?)\s+(\d{1,2}):(\d{2})", lower)
+    m_time_days = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(.+)", lower)
+    if m_days_time or m_time_days:
+        if m_days_time:
+            days_raw = m_days_time.group(1).strip()
+            d_hour, d_min = int(m_days_time.group(2)), int(m_days_time.group(3))
+        else:
+            assert m_time_days is not None
+            d_hour, d_min = int(m_time_days.group(1)), int(m_time_days.group(2))
+            days_raw = m_time_days.group(3).strip()
+        if days_raw != "besok" and not re.search(r"\d", days_raw):
+            try:
+                parsed_days = parse_days_expression(days_raw)
+            except ValueError:
+                parsed_days = []
+            if parsed_days:
+                if not (0 <= d_hour <= 23 and 0 <= d_min <= 59):
+                    raise ValueError("Jam harus antara 00:00 sampai 23:59.")
+                if len(parsed_days) == 7:
+                    dow_expr = "*"
+                    days_label = "Setiap hari"
+                else:
+                    dow_expr = ",".join(CRON_DAY_CODES[d] for d in parsed_days)
+                    days_label = f"Setiap {format_days_short(parsed_days)}"
+                return {
+                    "trigger": "cron",
+                    "cron": f"{d_min} {d_hour} * * {dow_expr}",
+                    "active_days": None,
+                    "label": f"{days_label} pukul {d_hour:02d}:{d_min:02d} {current.tzname()}",
+                }
 
     # 2. Interval berkala (termasuk per menit / per jam, opsional filter hari):
     #    "per menit", "permenit", "setiap menit", "setiap 15 menit", "per 2 jam",
@@ -97,38 +131,6 @@ def parse_flexible_schedule(raw: str, tz: ZoneInfo, now: datetime | None = None)
         if days_tail:
             res["active_days"] = active_days
         return res
-
-    # 2b. Hari tertentu + jam spesifik:
-    #     "senin 08:00", "sen,rab,jum 08:00", "setiap sen-jum 09:30", "08:00 sen-jum"
-    m_days_time = re.fullmatch(r"(.+?)\s+(\d{1,2}):(\d{2})", lower)
-    m_time_days = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(.+)", lower)
-    if m_days_time or m_time_days:
-        if m_days_time:
-            days_raw = m_days_time.group(1).strip()
-            d_hour, d_min = int(m_days_time.group(2)), int(m_days_time.group(3))
-        else:
-            assert m_time_days is not None
-            d_hour, d_min = int(m_time_days.group(1)), int(m_time_days.group(2))
-            days_raw = m_time_days.group(3).strip()
-        if days_raw != "besok" and not re.search(r"\d", days_raw):
-            try:
-                parsed_days = parse_days_expression(days_raw)
-            except ValueError:
-                parsed_days = []
-            if parsed_days:
-                if not (0 <= d_hour <= 23 and 0 <= d_min <= 59):
-                    raise ValueError("Jam harus antara 00:00 sampai 23:59.")
-                if len(parsed_days) == 7:
-                    dow_expr = "*"
-                    days_label = "Setiap hari"
-                else:
-                    dow_expr = ",".join(CRON_DAY_CODES[d] for d in parsed_days)
-                    days_label = f"Setiap {format_days_short(parsed_days)}"
-                return {
-                    "trigger": "cron",
-                    "cron": f"{d_min} {d_hour} * * {dow_expr}",
-                    "label": f"{days_label} pukul {d_hour:02d}:{d_min:02d} {current.tzname()}",
-                }
 
     # 3. Relatif sekali kirim: "+10 menit", "+2 jam", "10m", "2h", "+30 detik"
     m_rel = re.fullmatch(
@@ -686,25 +688,8 @@ def parse_active_window(raw: str) -> tuple[str | None, list[int] | None]:
 
     active_days: list[int] | None = None
     if len(parts) > 1 and parts[1].strip():
-        day_str = parts[1].strip()
-        if "-" in day_str and "," not in day_str:
-            a, b = [x.strip() for x in day_str.split("-", 1)]
-            if a not in DAY_NAME_MAP or b not in DAY_NAME_MAP:
-                raise ValueError("Nama hari tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
-            da, db = DAY_NAME_MAP[a], DAY_NAME_MAP[b]
-            if da <= db:
-                active_days = list(range(da, db + 1))
-            else:
-                active_days = list(range(da, 8)) + list(range(1, db + 1))
-        else:
-            days_set: set[int] = set()
-            for tok in re.split(r"[\s,]+", day_str):
-                if not tok:
-                    continue
-                if tok not in DAY_NAME_MAP:
-                    raise ValueError(f"Hari '{tok}' tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
-                days_set.add(DAY_NAME_MAP[tok])
-            active_days = sorted(days_set) if days_set else None
+        parsed_days = parse_days_expression(parts[1].strip())
+        active_days = None if len(parsed_days) == 7 else parsed_days
 
     return active_hours, active_days
 
