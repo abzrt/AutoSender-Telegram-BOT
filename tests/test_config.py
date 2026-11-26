@@ -335,3 +335,115 @@ def test_duplicate_id_raises(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="Duplikat ID"):
         load_schedules(dup_file)
+
+
+def test_per_minute_per_hour_and_per_day_schedules() -> None:
+    from bot import (
+        _resolve_time_text_with_mode,
+        apply_schedule_spec,
+        build_day_picker_prompt,
+        build_day_time_prompt,
+        build_flexible_time_prompt,
+        build_hour_schedule_prompt,
+        build_minute_schedule_prompt,
+    )
+    from config import parse_active_window
+
+    tz = ZoneInfo("Asia/Makassar")
+    fixed_now = datetime(2026, 11, 23, 10, 0, 0, tzinfo=tz)  # Senin
+
+    # Per menit
+    s_pm = parse_flexible_schedule("per menit", tz, now=fixed_now)
+    assert s_pm["trigger"] == "interval" and s_pm["minutes"] == 1
+    s_pm2 = parse_flexible_schedule("permenit", tz, now=fixed_now)
+    assert s_pm2["trigger"] == "interval" and s_pm2["minutes"] == 1
+    s_pm5 = parse_flexible_schedule("per 5 menit", tz, now=fixed_now)
+    assert s_pm5["trigger"] == "interval" and s_pm5["minutes"] == 5
+
+    # Per jam
+    s_pj = parse_flexible_schedule("per jam", tz, now=fixed_now)
+    assert s_pj["trigger"] == "interval" and s_pj["hours"] == 1
+    s_pj2 = parse_flexible_schedule("perjam", tz, now=fixed_now)
+    assert s_pj2["trigger"] == "interval" and s_pj2["hours"] == 1
+    s_pj3 = parse_flexible_schedule("per 3 jam", tz, now=fixed_now)
+    assert s_pj3["trigger"] == "interval" and s_pj3["hours"] == 3
+
+    # Per menit & per jam dengan filter hari tertentu
+    s_pm_days = parse_flexible_schedule("setiap 15 menit sen,rab,jum", tz, now=fixed_now)
+    assert s_pm_days["trigger"] == "interval"
+    assert s_pm_days["minutes"] == 15
+    assert s_pm_days["active_days"] == [1, 3, 5]
+
+    s_pj_days = parse_flexible_schedule("per 2 jam sen-jum", tz, now=fixed_now)
+    assert s_pj_days["trigger"] == "interval"
+    assert s_pj_days["hours"] == 2
+    assert s_pj_days["active_days"] == [1, 2, 3, 4, 5]
+
+    # Per hari tertentu + jam spesifik (cron)
+    s_days = parse_flexible_schedule("sen,rab,jum 08:30", tz, now=fixed_now)
+    assert s_days["trigger"] == "cron"
+    assert s_days["cron"] == "30 8 * * mon,wed,fri"
+
+    s_days_rev = parse_flexible_schedule("09:00 sen-jum", tz, now=fixed_now)
+    assert s_days_rev["trigger"] == "cron"
+    assert s_days_rev["cron"] == "0 9 * * mon,tue,wed,thu,fri"
+
+    # Pastikan APScheduler CronTrigger valid dengan day_of_week nama hari
+    cron_job = ScheduleJob(
+        id="days_1",
+        name="Hari Tertentu",
+        trigger="cron",
+        cron=s_days["cron"],
+        chat_ids=[123],
+        message="Halo",
+    )
+    cron_job.validate()
+    next_fire = build_trigger(cron_job, tz).get_next_fire_time(None, fixed_now)
+    assert next_fire is not None
+    assert next_fire.isoweekday() in (1, 3, 5)
+    assert (next_fire.hour, next_fire.minute) == (8, 30)
+
+    # apply_schedule_spec menerapkan active_days dari interval berfilter hari
+    apply_schedule_spec(cron_job, s_pm_days)
+    assert cron_job.trigger == "interval"
+    assert cron_job.minutes == 15
+    assert cron_job.active_days == [1, 3, 5]
+
+    # parse_active_window mendukung hari saja
+    assert parse_active_window("sen,rab,jum") == (None, [1, 3, 5])
+
+    # Menu tombol interaktif untuk per menit, per jam, dan pilih hari
+    cfg = BotConfig(bot_token="dummy")
+    _, main_time_kb = build_flexible_time_prompt(cfg, "Test")
+    main_cbs = [b.callback_data for row in main_time_kb.inline_keyboard for b in row]
+    assert "time:mode:minute" in main_cbs
+    assert "time:mode:hour" in main_cbs
+    assert "time:mode:days" in main_cbs
+
+    _, min_kb = build_minute_schedule_prompt("Test")
+    min_cbs = [b.callback_data for row in min_kb.inline_keyboard for b in row]
+    assert "time:quick:setiap 1 menit" in min_cbs
+    assert "time:quick:setiap 15 menit" in min_cbs
+
+    _, hr_kb = build_hour_schedule_prompt("Test")
+    hr_cbs = [b.callback_data for row in hr_kb.inline_keyboard for b in row]
+    assert "time:quick:setiap 1 jam" in hr_cbs
+    assert "time:quick:setiap 6 jam" in hr_cbs
+
+    _, day_kb = build_day_picker_prompt("Test", [1, 3, 5])
+    day_cbs = [b.callback_data for row in day_kb.inline_keyboard for b in row]
+    assert "time:day:t:1" in day_cbs
+    assert "time:day:t:7" in day_cbs
+    assert "time:day:next" in day_cbs
+
+    _, day_time_kb = build_day_time_prompt("Test", [1, 3, 5])
+    dt_cbs = [b.callback_data for row in day_time_kb.inline_keyboard for b in row]
+    assert "time:dayapply:08:00" in dt_cbs
+    assert "time:dayapply:setiap 15 menit" in dt_cbs
+    assert "time:dayapply:setiap 1 jam" in dt_cbs
+
+    # Mode-aware text input helper
+    assert _resolve_time_text_with_mode("7", {"time_input_mode": "minute"}) == "setiap 7 menit"
+    assert _resolve_time_text_with_mode("4", {"time_input_mode": "hour"}) == "setiap 4 jam"
+    assert _resolve_time_text_with_mode("08:30", {"time_input_mode": "days_time", "time_selected_days": [1, 3, 5]}) == "sen,rab,jum 08:30"
+    assert _resolve_time_text_with_mode("10 menit", {"time_input_mode": "days_time", "time_selected_days": [1, 5]}) == "setiap 10 menit sen,jum"

@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import html
 import logging
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,12 +39,14 @@ from telegram.ext import (
 )
 
 from config import (
+    DAY_LABELS,
     BotConfig,
     ScheduleJob,
     append_delivery_history,
     ensure_schedules_file,
     extract_mention_user_ids,
     format_active_window,
+    format_days_short,
     is_within_active_window,
     load_config,
     load_delivery_history,
@@ -725,16 +728,23 @@ def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, Inli
     text = (
         f"<b>{title}</b>\n\n"
         f"🕒 Waktu realtime: <code>{now.strftime('%Y-%m-%d %H:%M:%S %Z')}</code>\n\n"
-        "Pilih tombol cepat atau <b>ketik waktu bebas</b> dengan format apa saja:\n"
-        "• <b>Tanggal &amp; jam:</b> <code>2026-11-23 15:30</code> atau <code>23/11/2026 15:30</code>\n"
-        "• <b>Jam saja:</b> <code>15:30</code> atau <code>besok 08:00</code>\n"
+        "Pilih menu pengaturan (<b>Per Menit</b>, <b>Per Jam</b>, <b>Per Hari</b>), tombol cepat, atau <b>ketik waktu bebas</b>:\n"
+        "• <b>Per menit:</b> <code>per menit</code>, <code>setiap 5 menit</code>, <code>per 15 menit sen-jum</code>\n"
+        "• <b>Per jam:</b> <code>per jam</code>, <code>setiap 2 jam</code>, <code>per 3 jam sen,rab,jum</code>\n"
+        "• <b>Per hari tertentu:</b> <code>sen,rab,jum 08:00</code>, <code>sen-jum 09:30</code>, <code>setiap hari 08:00</code>\n"
+        "• <b>Tanggal &amp; jam:</b> <code>2026-11-23 15:30</code>, <code>15:30</code>, <code>besok 08:00</code>\n"
         "• <b>Dari sekarang:</b> <code>+10 menit</code>, <code>+2 jam</code>, <code>+30 detik</code>\n"
-        "• <b>Setiap hari:</b> <code>setiap hari 08:00</code>\n"
-        "• <b>Berkala:</b> <code>setiap 15 menit</code>, <code>setiap 2 jam</code>\n"
         "• <b>Cron 5-kolom:</b> <code>0 9 * * 1-5</code>"
     )
     keyboard = InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("⏱️ Atur Per Menit", callback_data="time:mode:minute"),
+                InlineKeyboardButton("🕐 Atur Per Jam", callback_data="time:mode:hour"),
+            ],
+            [
+                InlineKeyboardButton("📅 Pilih Hari (Per Hari Apa Saja)", callback_data="time:mode:days"),
+            ],
             [
                 InlineKeyboardButton(f"⏱️ +5 menit ({t_5m.strftime('%H:%M')})", callback_data="time:quick:+5 menit"),
                 InlineKeyboardButton(f"⏱️ +30 menit ({t_30m.strftime('%H:%M')})", callback_data="time:quick:+30 menit"),
@@ -750,6 +760,179 @@ def build_flexible_time_prompt(config: BotConfig, title: str) -> tuple[str, Inli
         ]
     )
     return text, keyboard
+
+
+def build_minute_schedule_prompt(title: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Sub-menu pengaturan jadwal kirim per menit."""
+    text = (
+        f"<b>⏱️ {title} — Kirim Per Menit</b>\n\n"
+        "Pilih interval menit di bawah, atau <b>ketik angka menit</b> (contoh: <code>7</code>, <code>setiap 12 menit</code>, "
+        "atau <code>setiap 10 menit sen-jum</code>):"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Setiap 1 Menit", callback_data="time:quick:setiap 1 menit"),
+                InlineKeyboardButton("Setiap 5 Menit", callback_data="time:quick:setiap 5 menit"),
+            ],
+            [
+                InlineKeyboardButton("Setiap 10 Menit", callback_data="time:quick:setiap 10 menit"),
+                InlineKeyboardButton("Setiap 15 Menit", callback_data="time:quick:setiap 15 menit"),
+            ],
+            [
+                InlineKeyboardButton("Setiap 30 Menit", callback_data="time:quick:setiap 30 menit"),
+                InlineKeyboardButton("Setiap 45 Menit", callback_data="time:quick:setiap 45 menit"),
+            ],
+            [
+                InlineKeyboardButton("📅 Per Menit di Hari Tertentu", callback_data="time:mode:days"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Kembali", callback_data="time:mode:back"),
+                InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
+            ],
+        ]
+    )
+    return text, keyboard
+
+
+def build_hour_schedule_prompt(title: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Sub-menu pengaturan jadwal kirim per jam."""
+    text = (
+        f"<b>🕐 {title} — Kirim Per Jam</b>\n\n"
+        "Pilih interval jam di bawah, atau <b>ketik angka jam</b> (contoh: <code>5</code>, <code>setiap 4 jam</code>, "
+        "atau <code>setiap 2 jam sen-jum</code>):"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Setiap 1 Jam", callback_data="time:quick:setiap 1 jam"),
+                InlineKeyboardButton("Setiap 2 Jam", callback_data="time:quick:setiap 2 jam"),
+            ],
+            [
+                InlineKeyboardButton("Setiap 3 Jam", callback_data="time:quick:setiap 3 jam"),
+                InlineKeyboardButton("Setiap 4 Jam", callback_data="time:quick:setiap 4 jam"),
+            ],
+            [
+                InlineKeyboardButton("Setiap 6 Jam", callback_data="time:quick:setiap 6 jam"),
+                InlineKeyboardButton("Setiap 12 Jam", callback_data="time:quick:setiap 12 jam"),
+            ],
+            [
+                InlineKeyboardButton("📅 Per Jam di Hari Tertentu", callback_data="time:mode:days"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Kembali", callback_data="time:mode:back"),
+                InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
+            ],
+        ]
+    )
+    return text, keyboard
+
+
+def build_day_picker_prompt(title: str, selected_days: list[int]) -> tuple[str, InlineKeyboardMarkup]:
+    """Checklist interaktif untuk memilih hari apa saja jadwal akan dikirim."""
+    selected_set = set(selected_days)
+    chosen_text = format_days_short(selected_days) if selected_days else "(belum dipilih)"
+    text = (
+        f"<b>📅 {title} — Pilih Hari Pengiriman</b>\n\n"
+        f"Hari dipilih: <code>{html.escape(chosen_text)}</code>\n\n"
+        "Centang hari apa saja yang diinginkan lalu klik <b>✅ Lanjut</b>, "
+        "atau langsung ketik (contoh: <code>sen,rab,jum 08:00</code>):"
+    )
+    row1 = [
+        InlineKeyboardButton(
+            f"{'☑️' if d in selected_set else '⬜'} {DAY_LABELS[d]}",
+            callback_data=f"time:day:t:{d}",
+        )
+        for d in (1, 2, 3, 4)
+    ]
+    row2 = [
+        InlineKeyboardButton(
+            f"{'☑️' if d in selected_set else '⬜'} {DAY_LABELS[d]}",
+            callback_data=f"time:day:t:{d}",
+        )
+        for d in (5, 6, 7)
+    ]
+    buttons: list[list[InlineKeyboardButton]] = [
+        row1,
+        row2,
+        [
+            InlineKeyboardButton("🏢 Sen–Jum", callback_data="time:day:p:work"),
+            InlineKeyboardButton("🌴 Sab–Min", callback_data="time:day:p:weekend"),
+            InlineKeyboardButton("📆 Semua", callback_data="time:day:p:all"),
+        ],
+    ]
+    if selected_days:
+        buttons.append(
+            [InlineKeyboardButton(f"✅ Lanjut Atur Jam/Interval ({len(selected_set)} hari)", callback_data="time:day:next")]
+        )
+    buttons.append(
+        [
+            InlineKeyboardButton("⬅️ Kembali", callback_data="time:mode:back"),
+            InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
+        ]
+    )
+    return text, InlineKeyboardMarkup(buttons)
+
+
+def build_day_time_prompt(title: str, selected_days: list[int]) -> tuple[str, InlineKeyboardMarkup]:
+    """Pilih jam tetap / per menit / per jam untuk hari-hari yang sudah dicentang."""
+    chosen_text = format_days_short(selected_days)
+    text = (
+        f"<b>📅 {title} — Atur Jam / Interval</b>\n\n"
+        f"Hari dipilih: <code>{html.escape(chosen_text)}</code>\n\n"
+        "Pilih jam atau interval di bawah, atau <b>ketik bebas</b>:\n"
+        "• Jam tertentu: <code>08:30</code> atau <code>14:00</code>\n"
+        "• Per menit di hari tsb: <code>setiap 10 menit</code> atau <code>10 menit</code>\n"
+        "• Per jam di hari tsb: <code>setiap 2 jam</code> atau <code>2 jam</code>"
+    )
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🕗 08:00", callback_data="time:dayapply:08:00"),
+                InlineKeyboardButton("🕘 09:00", callback_data="time:dayapply:09:00"),
+                InlineKeyboardButton("🕛 12:00", callback_data="time:dayapply:12:00"),
+                InlineKeyboardButton("🕔 17:00", callback_data="time:dayapply:17:00"),
+            ],
+            [
+                InlineKeyboardButton("⏱️ Tiap 15 Menit", callback_data="time:dayapply:setiap 15 menit"),
+                InlineKeyboardButton("⏱️ Tiap 30 Menit", callback_data="time:dayapply:setiap 30 menit"),
+            ],
+            [
+                InlineKeyboardButton("🕐 Tiap 1 Jam", callback_data="time:dayapply:setiap 1 jam"),
+                InlineKeyboardButton("🕐 Tiap 2 Jam", callback_data="time:dayapply:setiap 2 jam"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Ubah Hari", callback_data="time:mode:days"),
+                InlineKeyboardButton("❌ Batal", callback_data="wiz:cancel"),
+            ],
+        ]
+    )
+    return text, keyboard
+
+
+def _resolve_time_text_with_mode(raw_text: str, user_data: dict[str, Any]) -> str:
+    """Sesuaikan input teks bebas sesuai submenu waktu (per menit, per jam, atau per hari)."""
+    text = raw_text.strip()
+    mode = user_data.get("time_input_mode")
+    if mode == "minute" and text.isdigit():
+        return f"setiap {text} menit"
+    if mode == "hour" and text.isdigit():
+        return f"setiap {text} jam"
+    if mode == "days_time":
+        selected_days: list[int] = sorted(set(user_data.get("time_selected_days", [])))
+        if selected_days:
+            days_csv = ",".join(DAY_LABELS[d].lower() for d in selected_days if d in DAY_LABELS)
+            low = re.sub(r"\s+", " ", text.lower())
+            if text.isdigit():
+                return f"setiap {text} menit {days_csv}"
+            if re.fullmatch(r"\d{1,2}:\d{2}", low):
+                return f"{days_csv} {text}"
+            if low in ("permenit", "per menit", "setiap menit", "tiap menit", "perjam", "per jam", "setiap jam", "tiap jam"):
+                return f"{text} {days_csv}"
+            if re.fullmatch(r"(?:(?:setiap|tiap|interval|per)\s+)?\d+\s*(?:detik|dtk|menit|mnt|jam|hari)", low):
+                prefix = "" if any(low.startswith(p) for p in ("setiap ", "tiap ", "interval ", "per ")) else "setiap "
+                return f"{prefix}{text} {days_csv}"
+    return text
 
 
 async def resolve_mention_usernames_for_chat(
@@ -1221,6 +1404,8 @@ def apply_schedule_spec(job: ScheduleJob, spec: dict[str, Any]) -> None:
     job.hours = spec.get("hours")
     job.minutes = spec.get("minutes")
     job.seconds = spec.get("seconds")
+    if "active_days" in spec:
+        job.active_days = spec.get("active_days")
     job.enabled = True
     job.validate()
 
@@ -1260,6 +1445,7 @@ def save_new_custom_job(
         message=custom_msg,
         photo=photo,
         mentions=list(mentions or []),
+        active_days=spec.get("active_days"),
         enabled=True,
         parse_mode="HTML",
     )
@@ -1615,6 +1801,8 @@ async def wiz_target_done(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await query.answer()
     wiz["chat_ids"] = selected
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     config: BotConfig = context.bot_data["config"]
     text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -1640,10 +1828,130 @@ async def wiz_target_text(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             remember_group(context.bot_data, final_id, title, rtype)
 
     context.user_data["wiz"] = {"chat_ids": resolved_ids}
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     config: BotConfig = context.bot_data["config"]
     text, keyboard = build_flexible_time_prompt(config, "⏰ Atur Waktu Kirim Bebas (2/4)")
     await update.message.reply_html(text, reply_markup=keyboard)
     return ASK_DATETIME
+
+
+async def _handle_time_mode_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    base_title: str,
+    stay_state: int,
+) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    mode = query.data.split(":", 2)[2]
+    config: BotConfig = context.bot_data["config"]
+    if mode == "minute":
+        context.user_data["time_input_mode"] = "minute"
+        text, keyboard = build_minute_schedule_prompt(base_title)
+    elif mode == "hour":
+        context.user_data["time_input_mode"] = "hour"
+        text, keyboard = build_hour_schedule_prompt(base_title)
+    elif mode == "days":
+        context.user_data["time_input_mode"] = "days"
+        selected_days = list(context.user_data.get("time_selected_days", []))
+        text, keyboard = build_day_picker_prompt(base_title, selected_days)
+    else:
+        context.user_data.pop("time_input_mode", None)
+        text, keyboard = build_flexible_time_prompt(config, base_title)
+
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    return stay_state
+
+
+async def _handle_time_day_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    base_title: str,
+    stay_state: int,
+) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+
+    action = query.data.split(":", 2)[2]
+    selected: list[int] = sorted(set(context.user_data.get("time_selected_days", [])))
+
+    if action == "next":
+        if not selected:
+            await query.answer("Pilih minimal 1 hari terlebih dahulu!", show_alert=True)
+            return stay_state
+        await query.answer()
+        context.user_data["time_input_mode"] = "days_time"
+        text, keyboard = build_day_time_prompt(base_title, selected)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return stay_state
+
+    await query.answer()
+    if action.startswith("t:"):
+        day_num = int(action.split(":", 1)[1])
+        if day_num in selected:
+            selected.remove(day_num)
+        else:
+            selected.append(day_num)
+            selected.sort()
+    elif action == "p:work":
+        selected = [1, 2, 3, 4, 5]
+    elif action == "p:weekend":
+        selected = [6, 7]
+    elif action == "p:all":
+        selected = [1, 2, 3, 4, 5, 6, 7]
+
+    context.user_data["time_selected_days"] = selected
+    text, keyboard = build_day_picker_prompt(base_title, selected)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    return stay_state
+
+
+def _build_day_apply_expression(raw_apply: str, selected_days: list[int]) -> str:
+    days_csv = ",".join(DAY_LABELS[d].lower() for d in sorted(set(selected_days)) if d in DAY_LABELS)
+    if not days_csv:
+        return raw_apply
+    if re.fullmatch(r"\d{1,2}:\d{2}", raw_apply.strip()):
+        return f"{days_csv} {raw_apply.strip()}"
+    return f"{raw_apply.strip()} {days_csv}"
+
+
+async def wiz_time_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _handle_time_mode_menu(update, context, "⏰ Atur Waktu Kirim Bebas (2/4)", ASK_DATETIME)
+
+
+async def wiz_time_day_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _handle_time_day_menu(update, context, "⏰ Atur Waktu Kirim Bebas (2/4)", ASK_DATETIME)
+
+
+async def wiz_time_day_apply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    raw_apply = query.data.split(":", 2)[2]
+    selected_days: list[int] = list(context.user_data.get("time_selected_days", []))
+    expr = _build_day_apply_expression(raw_apply, selected_days)
+    config: BotConfig = context.bot_data["config"]
+    spec = parse_flexible_schedule(expr, config.tzinfo)
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
+    context.user_data.setdefault("wiz", {})["spec"] = spec
+
+    await query.edit_message_text(
+        "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
+        f"⏰ Waktu dipilih: <code>{html.escape(spec['label'])}</code>\n\n"
+        "Silakan ketik isi pesan custom yang ingin dikirim otomatis.\n"
+        "<i>Tips: kamu juga bisa langsung tulis <code>@username</code> atau <code>@[Nama](UserID)</code> di dalam pesan!</i>",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    return ASK_MESSAGE
 
 
 async def wiz_datetime_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1655,6 +1963,8 @@ async def wiz_datetime_quick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     expr = query.data.split(":", 2)[2]
     config: BotConfig = context.bot_data["config"]
     spec = parse_flexible_schedule(expr, config.tzinfo)
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     context.user_data.setdefault("wiz", {})["spec"] = spec
 
     await query.edit_message_text(
@@ -1673,12 +1983,15 @@ async def wiz_datetime_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ASK_DATETIME
 
     config: BotConfig = context.bot_data["config"]
+    resolved_input = _resolve_time_text_with_mode(update.message.text, context.user_data)
     try:
-        spec = parse_flexible_schedule(update.message.text, config.tzinfo)
+        spec = parse_flexible_schedule(resolved_input, config.tzinfo)
     except ValueError as exc:
         await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
         return ASK_DATETIME
 
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     context.user_data.setdefault("wiz", {})["spec"] = spec
     await update.message.reply_html(
         "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
@@ -2202,6 +2515,8 @@ async def edit_ask_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
     await query.answer()
 
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     target_id = context.user_data.get("edit_job_id", "")
     config: BotConfig = context.bot_data["config"]
     text, keyboard = build_flexible_time_prompt(
@@ -2618,6 +2933,42 @@ async def _apply_edited_time(
     return ConversationHandler.END
 
 
+async def edit_time_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    target_id = context.user_data.get("edit_job_id", "")
+    return await _handle_time_mode_menu(
+        update,
+        context,
+        f"⏰ Atur Waktu Baru untuk {html.escape(target_id)}",
+        EDIT_NEW_TIME,
+    )
+
+
+async def edit_time_day_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    target_id = context.user_data.get("edit_job_id", "")
+    return await _handle_time_day_menu(
+        update,
+        context,
+        f"⏰ Atur Waktu Baru untuk {html.escape(target_id)}",
+        EDIT_NEW_TIME,
+    )
+
+
+async def edit_time_day_apply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+
+    raw_apply = query.data.split(":", 2)[2]
+    selected_days: list[int] = list(context.user_data.get("time_selected_days", []))
+    expr = _build_day_apply_expression(raw_apply, selected_days)
+    config: BotConfig = context.bot_data["config"]
+    spec = parse_flexible_schedule(expr, config.tzinfo)
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
+    return await _apply_edited_time(update, context, spec)
+
+
 async def edit_save_time_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     if not query or not query.data:
@@ -2627,6 +2978,8 @@ async def edit_save_time_quick(update: Update, context: ContextTypes.DEFAULT_TYP
     expr = query.data.split(":", 2)[2]
     config: BotConfig = context.bot_data["config"]
     spec = parse_flexible_schedule(expr, config.tzinfo)
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     return await _apply_edited_time(update, context, spec)
 
 
@@ -2635,12 +2988,15 @@ async def edit_save_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE
         return EDIT_NEW_TIME
 
     config: BotConfig = context.bot_data["config"]
+    resolved_input = _resolve_time_text_with_mode(update.message.text, context.user_data)
     try:
-        spec = parse_flexible_schedule(update.message.text, config.tzinfo)
+        spec = parse_flexible_schedule(resolved_input, config.tzinfo)
     except ValueError as exc:
         await update.message.reply_text(str(exc), reply_markup=build_cancel_keyboard())
         return EDIT_NEW_TIME
 
+    context.user_data.pop("time_input_mode", None)
+    context.user_data.pop("time_selected_days", None)
     return await _apply_edited_time(update, context, spec)
 
 
@@ -3444,6 +3800,9 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_target_text),
             ],
             ASK_DATETIME: [
+                CallbackQueryHandler(wiz_time_mode, pattern=r"^time:mode:.+$"),
+                CallbackQueryHandler(wiz_time_day_action, pattern=r"^time:day:.+$"),
+                CallbackQueryHandler(wiz_time_day_apply, pattern=r"^time:dayapply:.+$"),
                 CallbackQueryHandler(wiz_datetime_quick, pattern=r"^time:quick:.+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_datetime_text),
             ],
@@ -3475,6 +3834,9 @@ def main() -> None:
                 MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), edit_save_message),
             ],
             EDIT_NEW_TIME: [
+                CallbackQueryHandler(edit_time_mode, pattern=r"^time:mode:.+$"),
+                CallbackQueryHandler(edit_time_day_action, pattern=r"^time:day:.+$"),
+                CallbackQueryHandler(edit_time_day_apply, pattern=r"^time:dayapply:.+$"),
                 CallbackQueryHandler(edit_save_time_quick, pattern=r"^time:quick:.+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_time_text),
             ],

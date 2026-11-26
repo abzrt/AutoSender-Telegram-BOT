@@ -66,23 +66,69 @@ def parse_flexible_schedule(raw: str, tz: ZoneInfo, now: datetime | None = None)
             "label": f"Setiap hari pukul {hour:02d}:{minute:02d} {current.tzname()}",
         }
 
-    # 2. Interval berkala: "setiap 15 menit" / "tiap 2 jam" / "setiap 30 detik" / "setiap 1 hari"
+    # 2. Interval berkala (termasuk per menit / per jam, opsional filter hari):
+    #    "per menit", "permenit", "setiap menit", "setiap 15 menit", "per 2 jam",
+    #    "setiap 15 menit sen-jum", "per jam sen,rab,jum"
     m_interval = re.fullmatch(
-        r"(?:setiap|tiap|interval)\s+(\d+)\s*(detik|dtk|s|sec|menit|mnt|m|min|jam|j|h|hour|hari|d|day)s?",
+        r"(?:setiap|tiap|interval|per)\s*(?:(\d+)\s*)?(detik|dtk|s|sec|menit|mnt|m|min|jam|j|h|hour|hari|d|day)s?(?:\s+(.+))?",
         lower,
     )
     if m_interval:
-        amount = int(m_interval.group(1))
+        amount = int(m_interval.group(1)) if m_interval.group(1) else 1
         unit = m_interval.group(2)
+        days_tail = (m_interval.group(3) or "").strip()
         if amount <= 0:
             raise ValueError("Nilai interval harus lebih besar dari 0.")
+        active_days: list[int] | None = None
+        days_suffix = ""
+        if days_tail:
+            parsed_days = parse_days_expression(days_tail)
+            if len(parsed_days) < 7:
+                active_days = parsed_days
+                days_suffix = f" ({format_days_short(parsed_days)})"
         if unit in ("detik", "dtk", "s", "sec"):
-            return {"trigger": "interval", "seconds": amount, "label": f"Setiap {amount} detik"}
-        if unit in ("menit", "mnt", "m", "min"):
-            return {"trigger": "interval", "minutes": amount, "label": f"Setiap {amount} menit"}
-        if unit in ("jam", "j", "h", "hour"):
-            return {"trigger": "interval", "hours": amount, "label": f"Setiap {amount} jam"}
-        return {"trigger": "interval", "days": amount, "label": f"Setiap {amount} hari"}
+            res: dict[str, Any] = {"trigger": "interval", "seconds": amount, "label": f"Setiap {amount} detik{days_suffix}"}
+        elif unit in ("menit", "mnt", "m", "min"):
+            res = {"trigger": "interval", "minutes": amount, "label": f"Setiap {amount} menit{days_suffix}"}
+        elif unit in ("jam", "j", "h", "hour"):
+            res = {"trigger": "interval", "hours": amount, "label": f"Setiap {amount} jam{days_suffix}"}
+        else:
+            res = {"trigger": "interval", "days": amount, "label": f"Setiap {amount} hari{days_suffix}"}
+        if days_tail:
+            res["active_days"] = active_days
+        return res
+
+    # 2b. Hari tertentu + jam spesifik:
+    #     "senin 08:00", "sen,rab,jum 08:00", "setiap sen-jum 09:30", "08:00 sen-jum"
+    m_days_time = re.fullmatch(r"(.+?)\s+(\d{1,2}):(\d{2})", lower)
+    m_time_days = re.fullmatch(r"(\d{1,2}):(\d{2})\s+(.+)", lower)
+    if m_days_time or m_time_days:
+        if m_days_time:
+            days_raw = m_days_time.group(1).strip()
+            d_hour, d_min = int(m_days_time.group(2)), int(m_days_time.group(3))
+        else:
+            assert m_time_days is not None
+            d_hour, d_min = int(m_time_days.group(1)), int(m_time_days.group(2))
+            days_raw = m_time_days.group(3).strip()
+        if days_raw != "besok" and not re.search(r"\d", days_raw):
+            try:
+                parsed_days = parse_days_expression(days_raw)
+            except ValueError:
+                parsed_days = []
+            if parsed_days:
+                if not (0 <= d_hour <= 23 and 0 <= d_min <= 59):
+                    raise ValueError("Jam harus antara 00:00 sampai 23:59.")
+                if len(parsed_days) == 7:
+                    dow_expr = "*"
+                    days_label = "Setiap hari"
+                else:
+                    dow_expr = ",".join(CRON_DAY_CODES[d] for d in parsed_days)
+                    days_label = f"Setiap {format_days_short(parsed_days)}"
+                return {
+                    "trigger": "cron",
+                    "cron": f"{d_min} {d_hour} * * {dow_expr}",
+                    "label": f"{days_label} pukul {d_hour:02d}:{d_min:02d} {current.tzname()}",
+                }
 
     # 3. Relatif sekali kirim: "+10 menit", "+2 jam", "10m", "2h", "+30 detik"
     m_rel = re.fullmatch(
@@ -139,9 +185,13 @@ def parse_flexible_schedule(raw: str, tz: ZoneInfo, now: datetime | None = None)
             "label": run_dt.strftime("%Y-%m-%d %H:%M:%S %Z"),
         }
 
-    # 6. Ekspresi cron 5 kolom: "0 9 * * 1-5"
+    # 6. Ekspresi cron 5 kolom: "0 9 * * 1-5" atau "0 9 * * mon,wed,fri"
     parts = text.split()
-    if len(parts) == 5 and all(re.fullmatch(r"[\d\*/,\-]+", p) for p in parts):
+    if (
+        len(parts) == 5
+        and all(re.fullmatch(r"[\d\*/,\-]+", p) for p in parts[:4])
+        and re.fullmatch(r"[\d\*/,\-a-zA-Z]+", parts[4])
+    ):
         return {
             "trigger": "cron",
             "cron": text,
@@ -535,17 +585,74 @@ def append_delivery_history(path: str | Path, entry: dict[str, Any], max_items: 
 
 
 DAY_NAME_MAP: dict[str, int] = {
-    "sen": 1, "senin": 1, "mon": 1,
-    "sel": 2, "selasa": 2, "tue": 2,
-    "rab": 3, "rabu": 3, "wed": 3,
-    "kam": 4, "kamis": 4, "thu": 4,
-    "jum": 5, "jumat": 5, "fri": 5,
-    "sab": 6, "sabtu": 6, "sat": 6,
-    "min": 7, "minggu": 7, "sun": 7,
+    "sen": 1, "senin": 1, "mon": 1, "monday": 1,
+    "sel": 2, "selasa": 2, "tue": 2, "tuesday": 2,
+    "rab": 3, "rabu": 3, "wed": 3, "wednesday": 3,
+    "kam": 4, "kamis": 4, "thu": 4, "thursday": 4,
+    "jum": 5, "jumat": 5, "jum'at": 5, "fri": 5, "friday": 5,
+    "sab": 6, "sabtu": 6, "sat": 6, "saturday": 6,
+    "min": 7, "minggu": 7, "ahad": 7, "sun": 7, "sunday": 7,
 }
 DAY_LABELS: dict[int, str] = {
     1: "Sen", 2: "Sel", 3: "Rab", 4: "Kam", 5: "Jum", 6: "Sab", 7: "Min",
 }
+CRON_DAY_CODES: dict[int, str] = {
+    1: "mon", 2: "tue", 3: "wed", 4: "thu", 5: "fri", 6: "sat", 7: "sun",
+}
+
+
+def format_days_short(days: list[int]) -> str:
+    """Format daftar ISO weekday [1..7] menjadi label singkat bahasa Indonesia."""
+    ordered = sorted(set(days))
+    if len(ordered) == 7:
+        return "Setiap Hari"
+    if ordered == [1, 2, 3, 4, 5]:
+        return "Sen–Jum"
+    if ordered == [6, 7]:
+        return "Sab–Min"
+    return ", ".join(DAY_LABELS.get(d, str(d)) for d in ordered)
+
+
+def parse_days_expression(raw: str) -> list[int]:
+    """Parse daftar hari seperti 'sen-jum', 'senin, rabu, jumat', 'sab-min', 'semua'."""
+    day_str = re.sub(r"\s*-\s*", "-", raw.strip().lower())
+    day_str = re.sub(r"^(?:setiap|tiap|pada)?\s*(?:hari\s+)?", "", day_str).strip()
+    day_str = re.sub(r"\bdan\b", ",", day_str)
+    if not day_str:
+        raise ValueError("Nama hari tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+    if day_str in ("semua", "setiap hari", "tiap hari", "harian", "all", "everyday"):
+        return [1, 2, 3, 4, 5, 6, 7]
+    if day_str in ("weekday", "weekdays", "hari kerja", "kerja"):
+        return [1, 2, 3, 4, 5]
+    if day_str in ("weekend", "weekends", "akhir pekan", "libur"):
+        return [6, 7]
+
+    days_set: set[int] = set()
+    for chunk in re.split(r"[,]+", day_str):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        for tok in chunk.split():
+            tok = tok.strip()
+            if not tok:
+                continue
+            if "-" in tok:
+                a, b = [x.strip() for x in tok.split("-", 1)]
+                if a not in DAY_NAME_MAP or b not in DAY_NAME_MAP:
+                    raise ValueError("Nama hari tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+                da, db = DAY_NAME_MAP[a], DAY_NAME_MAP[b]
+                if da <= db:
+                    days_set.update(range(da, db + 1))
+                else:
+                    days_set.update(range(da, 8))
+                    days_set.update(range(1, db + 1))
+            else:
+                if tok not in DAY_NAME_MAP:
+                    raise ValueError(f"Hari '{tok}' tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+                days_set.add(DAY_NAME_MAP[tok])
+    if not days_set:
+        raise ValueError("Nama hari tidak valid. Gunakan: sen, sel, rab, kam, jum, sab, min.")
+    return sorted(days_set)
 
 
 def parse_active_window(raw: str) -> tuple[str | None, list[int] | None]:
@@ -554,6 +661,7 @@ def parse_active_window(raw: str) -> tuple[str | None, list[int] | None]:
     - '08:00-17:00' -> ('08:00-17:00', None)
     - '08:00-17:00 sen-jum' -> ('08:00-17:00', [1,2,3,4,5])
     - '08:00-17:00 sen,rab,jum' -> ('08:00-17:00', [1,3,5])
+    - 'sen,rab,jum' -> (None, [1,3,5])
     """
     text = re.sub(r"\s+", " ", raw.strip().lower())
     if text in ("24 jam", "24jam", "off", "hapus", "none", "bebas", "semua"):
@@ -563,8 +671,13 @@ def parse_active_window(raw: str) -> tuple[str | None, list[int] | None]:
     hour_part = parts[0]
     m_hour = re.fullmatch(r"(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})", hour_part)
     if not m_hour:
+        try:
+            days_only = parse_days_expression(text)
+            return None, (None if len(days_only) == 7 else days_only)
+        except ValueError:
+            pass
         raise ValueError(
-            "Format jam operasional tidak valid. Contoh: '08:00-17:00', '08:00-17:00 sen-jum', atau '24 jam'."
+            "Format jam operasional tidak valid. Contoh: '08:00-17:00', '08:00-17:00 sen-jum', 'sen,rab,jum', atau '24 jam'."
         )
     sh, sm, eh, em = (int(m_hour.group(i)) for i in range(1, 5))
     if not (0 <= sh <= 23 and 0 <= sm <= 59 and 0 <= eh <= 23 and 0 <= em <= 59):
