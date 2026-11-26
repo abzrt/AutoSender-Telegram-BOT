@@ -319,3 +319,184 @@ async def test_send_self_preview_message_and_button() -> None:
     assert "job:testself:custom_1" in cbs
     assert "job:test:custom_1" in cbs
 
+
+def test_dynamic_placeholders_and_job_fields_persistence(tmp_path) -> None:
+    from datetime import datetime
+    from config import render_dynamic_placeholders
+
+    tz = ZoneInfo("Asia/Makassar")
+    fixed_dt = datetime(2026, 11, 26, 14, 30, 5, tzinfo=tz)  # Kamis
+    out = render_dynamic_placeholders(
+        "Laporan {hari}, {tanggal} ({tanggal_panjang}) jam {jam} | {bulan} {tahun} | {unknown}",
+        now=fixed_dt,
+    )
+    assert out == "Laporan Kamis, 26/11/2026 (26 November 2026) jam 14:30 | November 2026 | {unknown}"
+
+    out_file = tmp_path / "schedules.json"
+    job = ScheduleJob(
+        id="doc_topic",
+        name="SOP PDF",
+        trigger="interval",
+        hours=2,
+        chat_ids=[-100123456],
+        message="",
+        document="BQACAgUAAxkBAAI_fake_doc_id",
+        thread_id=42,
+        auto_delete_prev=True,
+        require_ack=True,
+    )
+    job.validate()
+    save_schedules(out_file, [job])
+    reloaded = load_schedules(out_file)
+    assert len(reloaded) == 1
+    assert reloaded[0].document == "BQACAgUAAxkBAAI_fake_doc_id"
+    assert reloaded[0].thread_id == 42
+    assert reloaded[0].auto_delete_prev is True
+    assert reloaded[0].require_ack is True
+
+
+@pytest.mark.anyio
+async def test_antispam_ack_retry_admin_alert_document_and_thread(tmp_path) -> None:
+    from bot import handle_menu_callback
+    from config import load_runtime_state
+
+    cfg = BotConfig(bot_token="dummy", admin_ids={217411824}, schedules_file=tmp_path / "schedules.json")
+    fake_bot = AsyncMock()
+    fake_bot.send_document.side_effect = [
+        SimpleNamespace(message_id=101),
+        SimpleNamespace(message_id=102),
+    ]
+
+    job = ScheduleJob(
+        id="sop_1",
+        name="Pengingat SOP",
+        trigger="interval",
+        minutes=30,
+        chat_ids=[-100999],
+        message="Update tiket hari {hari}",
+        document="DOC_FILE_ID",
+        thread_id=77,
+        auto_delete_prev=True,
+        require_ack=True,
+    )
+
+    # Kiriman pertama: simpan message_id=101, kirim ke topic 77, ada tombol ack
+    ok1, fail1 = await send_scheduled_message(fake_bot, job, config=cfg)
+    assert (ok1, fail1) == (1, 0)
+    kwargs1 = fake_bot.send_document.call_args_list[0].kwargs
+    assert kwargs1["message_thread_id"] == 77
+    assert kwargs1["document"] == "DOC_FILE_ID"
+    assert "{hari}" not in kwargs1["caption"]
+    ack_btn = kwargs1["reply_markup"].inline_keyboard[0][0]
+    assert ack_btn.callback_data == "ack:done:sop_1"
+
+    # Kiriman kedua: hapus pesan sebelumnya (101) lalu simpan 102
+    ok2, fail2 = await send_scheduled_message(fake_bot, job, config=cfg)
+    assert (ok2, fail2) == (1, 0)
+    fake_bot.delete_message.assert_awaited_once_with(chat_id=-100999, message_id=101)
+    assert load_runtime_state(cfg.resolved_state_file)["last_messages"]["sop_1"]["-100999"] == 102
+
+    # Anggota grup (non-admin) klik tombol "✅ Sudah Dikerjakan"
+    fake_query = SimpleNamespace(
+        data="ack:done:sop_1",
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+        message=None,
+    )
+    fake_update = SimpleNamespace(
+        callback_query=fake_query,
+        effective_user=SimpleNamespace(id=555555, first_name="Nasir", last_name=None, username=None, full_name="Nasir"),
+        effective_chat=SimpleNamespace(id=-100999, type="supergroup"),
+    )
+    fake_ctx = SimpleNamespace(bot_data={"config": cfg, "scheduler": SimpleNamespace(get_jobs=lambda: [])}, bot=fake_bot)
+    await handle_menu_callback(fake_update, fake_ctx)
+    fake_query.edit_message_reply_markup.assert_awaited_once()
+
+    # Kiriman ketiga di hari yang sama dilewati karena sudah ack
+    ok3, fail3 = await send_scheduled_message(fake_bot, job, config=cfg)
+    assert (ok3, fail3) == (0, 0)
+
+    # Auto-retry sukses pada percobaan ke-2
+    retry_bot = AsyncMock()
+    retry_bot.send_message.side_effect = [TelegramError("Temporary timeout"), SimpleNamespace(message_id=200)]
+    simple_job = ScheduleJob(id="r1", name="Retry Test", trigger="interval", minutes=10, chat_ids=[-100888], message="Halo")
+    ok_r, fail_r = await send_scheduled_message(retry_bot, simple_job, config=cfg, max_retries=2, retry_delay=0.0)
+    assert (ok_r, fail_r) == (1, 0)
+    assert retry_bot.send_message.await_count == 2
+
+    # Jika semua retry gagal -> kirim notifikasi error ke admin (217411824)
+    fail_bot = AsyncMock()
+    fail_bot.send_message.side_effect = [
+        TelegramError("Bot kicked"),
+        TelegramError("Bot kicked"),
+        SimpleNamespace(message_id=300),  # alert ke admin
+    ]
+    ok_f, fail_f = await send_scheduled_message(fail_bot, simple_job, config=cfg, max_retries=2, retry_delay=0.0)
+    assert (ok_f, fail_f) == (0, 1)
+    assert fail_bot.send_message.await_count == 3
+    assert fail_bot.send_message.call_args_list[2].kwargs["chat_id"] == 217411824
+    assert "Gagal Kirim Jadwal" in fail_bot.send_message.call_args_list[2].kwargs["text"]
+
+
+def test_duplicate_cleanup_and_restore_backup(tmp_path) -> None:
+    import json
+    from datetime import datetime
+    from bot import (
+        duplicate_schedule_job,
+        format_jobs_list_and_keyboard,
+        purge_expired_date_jobs,
+        restore_backup_file,
+    )
+
+    tz = ZoneInfo("Asia/Makassar")
+    cfg = BotConfig(bot_token="dummy", schedules_file=tmp_path / "schedules.json")
+    past_job = ScheduleJob(id="old_1", name="Lama", trigger="date", run_at="2025-01-01 08:00:00", chat_ids=[123], message="Lama")
+    future_job = ScheduleJob(id="fut_1", name="Masa Depan", trigger="date", run_at="2027-01-01 08:00:00", chat_ids=[123], message="Nanti")
+    active_job = ScheduleJob(id="int_1", name="Berkala", trigger="interval", minutes=30, chat_ids=[123], message="Rutin", thread_id=9, auto_delete_prev=True)
+
+    # 1. Cleanup jadwal kadaluarsa
+    kept, removed = purge_expired_date_jobs([past_job, future_job, active_job], tz, now=datetime(2026, 11, 26, 14, 0, tzinfo=tz))
+    assert [j.id for j in removed] == ["old_1"]
+    assert [j.id for j in kept] == ["fut_1", "int_1"]
+
+    # Tombol cleanup muncul jika ada jadwal date kadaluarsa
+    fake_scheduler = SimpleNamespace(get_jobs=lambda: [], remove_all_jobs=lambda: None, add_job=lambda *a, **kw: None)
+    _, markup = format_jobs_list_and_keyboard(fake_scheduler, [past_job, active_job])
+    cbs = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert "job:cleanup" in cbs
+
+    # 2. Duplikat jadwal 1 klik
+    bot_data = {"config": cfg, "jobs": [active_job], "scheduler": fake_scheduler, "known_groups": {}, "tag_presets": {}}
+    fake_ctx = SimpleNamespace(bot_data=bot_data, bot=None)
+    cloned = duplicate_schedule_job(fake_ctx, "int_1")
+    assert cloned is not None
+    assert cloned.id == "int_1_copy"
+    assert cloned.enabled is False
+    assert cloned.thread_id == 9
+    assert cloned.auto_delete_prev is True
+    assert len(load_schedules(cfg.schedules_file)) == 2
+
+    # 3. Restore backup JSON (schedules, groups, admins, presets)
+    sched_payload = json.dumps([active_job.to_dict()]).encode("utf-8")
+    msg_s = restore_backup_file(cfg, "schedules.json", sched_payload, bot_data)
+    assert "1 jadwal" in msg_s
+    assert len(bot_data["jobs"]) == 1
+
+    groups_payload = json.dumps({"-1001": {"title": "Grup QC", "type": "supergroup"}}).encode("utf-8")
+    msg_g = restore_backup_file(cfg, "groups.json", groups_payload, bot_data)
+    assert "1 target" in msg_g
+    assert "-1001" in bot_data["known_groups"]
+
+    admins_payload = json.dumps([111, 222]).encode("utf-8")
+    msg_a = restore_backup_file(cfg, "admins.json", admins_payload, bot_data)
+    assert "2 admin" in msg_a
+    assert bot_data["extra_admins"] == {111, 222}
+
+    presets_payload = json.dumps({"Shift Malam": ["@budi"]}).encode("utf-8")
+    msg_p = restore_backup_file(cfg, "presets.json", presets_payload, bot_data)
+    assert "1 preset" in msg_p
+    assert bot_data["tag_presets"] == {"Shift Malam": ["@budi"]}
+
+    with pytest.raises(ValueError, match="tidak didukung"):
+        restore_backup_file(cfg, "random.txt", b"{}", bot_data)
+

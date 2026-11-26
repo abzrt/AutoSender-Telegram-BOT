@@ -226,6 +226,10 @@ class ScheduleJob:
     enabled: bool = True
     parse_mode: str | None = "HTML"
     photo: str | None = None
+    document: str | None = None
+    thread_id: int | None = None
+    auto_delete_prev: bool = False
+    require_ack: bool = False
     mentions: list[str] = field(default_factory=list)
     # Jam operasional opsional (contoh: active_hours="08:00-17:00", active_days=[1,2,3,4,5])
     active_hours: str | None = None
@@ -245,8 +249,8 @@ class ScheduleJob:
             raise ValueError("Setiap jadwal harus memiliki 'id' yang tidak kosong.")
         if not self.chat_ids:
             raise ValueError(f"Jadwal '{self.id}' harus memiliki minimal satu chat_id.")
-        if not self.message and not self.photo:
-            raise ValueError(f"Jadwal '{self.id}' harus memiliki 'message' atau 'photo'.")
+        if not self.message and not self.photo and not self.document:
+            raise ValueError(f"Jadwal '{self.id}' harus memiliki 'message', 'photo', atau 'document'.")
         if self.trigger == "cron":
             if not self.cron or len(self.cron.split()) != 5:
                 raise ValueError(
@@ -299,6 +303,14 @@ class ScheduleJob:
             data["parse_mode"] = self.parse_mode
         if self.photo:
             data["photo"] = self.photo
+        if self.document:
+            data["document"] = self.document
+        if self.thread_id is not None:
+            data["thread_id"] = self.thread_id
+        if self.auto_delete_prev:
+            data["auto_delete_prev"] = True
+        if self.require_ack:
+            data["require_ack"] = True
         if self.mentions:
             data["mentions"] = self.mentions
         if self.active_hours:
@@ -344,6 +356,10 @@ class BotConfig:
     @property
     def resolved_history_file(self) -> Path:
         return self.schedules_file.parent / "history.json"
+
+    @property
+    def resolved_state_file(self) -> Path:
+        return self.schedules_file.parent / "state.json"
 
 
 def load_config(env_path: str | Path | None = None, require_token: bool = True) -> BotConfig:
@@ -408,6 +424,10 @@ def load_schedules(path: str | Path) -> list[ScheduleJob]:
             enabled=bool(item.get("enabled", True)),
             parse_mode=item.get("parse_mode", "HTML"),
             photo=item.get("photo"),
+            document=item.get("document"),
+            thread_id=int(item["thread_id"]) if item.get("thread_id") is not None else None,
+            auto_delete_prev=bool(item.get("auto_delete_prev", False)),
+            require_ack=bool(item.get("require_ack", False)),
             mentions=list(item.get("mentions", [])),
             active_hours=item.get("active_hours"),
             active_days=list(item["active_days"]) if item.get("active_days") else None,
@@ -584,6 +604,63 @@ def append_delivery_history(path: str | Path, entry: dict[str, Any], max_items: 
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text(json.dumps(history, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def load_runtime_state(path: str | Path) -> dict[str, Any]:
+    """Muat state runtime (last_messages untuk anti-spam & ack_dates untuk tombol selesai)."""
+    file_path = Path(path)
+    default_state: dict[str, Any] = {"last_messages": {}, "ack_dates": {}}
+    if not file_path.exists():
+        return default_state
+    try:
+        data = json.loads(file_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_state
+    if not isinstance(data, dict):
+        return default_state
+    return {
+        "last_messages": data.get("last_messages") if isinstance(data.get("last_messages"), dict) else {},
+        "ack_dates": data.get("ack_dates") if isinstance(data.get("ack_dates"), dict) else {},
+    }
+
+
+def save_runtime_state(path: str | Path, state: dict[str, Any]) -> None:
+    """Simpan state runtime ke state.json."""
+    file_path = Path(path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(json.dumps(state, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+DAY_FULL_LABELS: dict[int, str] = {
+    1: "Senin", 2: "Selasa", 3: "Rabu", 4: "Kamis", 5: "Jumat", 6: "Sabtu", 7: "Minggu",
+}
+MONTH_LABELS: dict[int, str] = {
+    1: "Januari", 2: "Februari", 3: "Maret", 4: "April", 5: "Mei", 6: "Juni",
+    7: "Juli", 8: "Agustus", 9: "September", 10: "Oktober", 11: "November", 12: "Desember",
+}
+
+
+def render_dynamic_placeholders(message: str, now: datetime | None = None) -> str:
+    """Ganti variabel dinamis {hari}, {tanggal}, {tanggal_panjang}, {jam}, {waktu}, {bulan}, {tahun}."""
+    if not message or "{" not in message:
+        return message
+    current = now or datetime.now()
+    tz_part = f" {current.tzname()}" if current.tzname() else ""
+    replacements = {
+        "hari": DAY_FULL_LABELS.get(current.isoweekday(), ""),
+        "tanggal": current.strftime("%d/%m/%Y"),
+        "tanggal_panjang": f"{current.day} {MONTH_LABELS.get(current.month, '')} {current.year}",
+        "jam": current.strftime("%H:%M"),
+        "waktu": f"{current.strftime('%H:%M:%S')}{tz_part}",
+        "bulan": MONTH_LABELS.get(current.month, ""),
+        "tahun": str(current.year),
+    }
+
+    def _sub(match: re.Match[str]) -> str:
+        key = match.group(1).lower()
+        return replacements.get(key, match.group(0))
+
+    return re.sub(r"\{([a-zA-Z_]+)\}", _sub, message)
 
 
 DAY_NAME_MAP: dict[str, int] = {

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import html
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from telegram import Bot, BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, ChatMigrated, TelegramError
+from telegram.error import BadRequest, ChatMigrated, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -53,6 +54,7 @@ from config import (
     load_extra_admins,
     load_known_groups,
     load_known_members,
+    load_runtime_state,
     load_schedules,
     load_tag_presets,
     parse_active_window,
@@ -60,10 +62,12 @@ from config import (
     parse_mentions,
     parse_run_at,
     parse_user_ids,
+    render_dynamic_placeholders,
     render_message_with_mentions,
     save_extra_admins,
     save_known_groups,
     save_known_members,
+    save_runtime_state,
     save_schedules,
     save_tag_presets,
 )
@@ -89,11 +93,13 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
     EDIT_NEW_TARGET,
     EDIT_NEW_MENTIONS,
     EDIT_NEW_HOURS,
+    EDIT_NEW_THREAD,
     ADMIN_ADD_ID,
     TARGET_ADD_INPUT,
     PRESET_ASK_NAME,
     PRESET_PICK_MEMBERS,
-) = range(16)
+    RESTORE_UPLOAD,
+) = range(18)
 
 
 def parse_chat_ids(raw: str) -> list[int | str]:
@@ -1000,13 +1006,17 @@ async def send_self_preview_message(
     saved_targets: dict[str, dict[str, str]] | None = None,
     tag_presets: dict[str, list[str]] | None = None,
     config: BotConfig | None = None,
+    document: str | None = None,
+    require_ack: bool = False,
 ) -> tuple[bool, str | None, list[str]]:
     """Kirim preview hasil pesan custom langsung ke diri sendiri (chat pribadi admin)."""
+    now = datetime.now(config.tzinfo) if config else datetime.now()
+    expanded_message = render_dynamic_placeholders(message, now)
     uid_usernames: dict[str, str] = {}
     warnings: list[str] = []
 
     numeric_uids = extract_mention_user_ids(
-        message,
+        expanded_message,
         mentions=mentions,
         saved_targets=saved_targets,
         tag_presets=tag_presets,
@@ -1037,12 +1047,17 @@ async def send_self_preview_message(
             uid_usernames.update(resolved_map)
 
     final_text = render_message_with_mentions(
-        message,
+        expanded_message,
         mentions,
         parse_mode,
         saved_targets=saved_targets,
         tag_presets=tag_presets,
         uid_usernames=uid_usernames,
+    )
+    reply_markup = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("✅ Sudah Dikerjakan (Preview)", callback_data="ack:noop")]])
+        if require_ack
+        else None
     )
 
     try:
@@ -1055,6 +1070,7 @@ async def send_self_preview_message(
                         photo=photo_file,
                         caption=final_text or None,
                         parse_mode=parse_mode,
+                        reply_markup=reply_markup,
                     )
             else:
                 await bot.send_photo(
@@ -1062,17 +1078,70 @@ async def send_self_preview_message(
                     photo=photo,
                     caption=final_text or None,
                     parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                )
+        elif document:
+            doc_path = Path(document)
+            if doc_path.exists() and doc_path.is_file():
+                with doc_path.open("rb") as doc_file:
+                    await bot.send_document(
+                        chat_id=self_chat_id,
+                        document=doc_file,
+                        caption=final_text or None,
+                        parse_mode=parse_mode,
+                        reply_markup=reply_markup,
+                    )
+            else:
+                await bot.send_document(
+                    chat_id=self_chat_id,
+                    document=document,
+                    caption=final_text or None,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
                 )
         else:
             await bot.send_message(
                 chat_id=self_chat_id,
                 text=final_text,
                 parse_mode=parse_mode,
+                reply_markup=reply_markup,
             )
         return True, None, warnings
     except TelegramError as exc:
         logger.error("Gagal mengirim preview ke diri sendiri (%s): %s", self_chat_id, exc)
         return False, str(exc), warnings
+
+
+async def _notify_admins_delivery_failure(
+    bot: Bot,
+    config: BotConfig,
+    job: ScheduleJob,
+    failures: list[tuple[int | str, str]],
+) -> None:
+    """Kirim notifikasi ke admin jika ada pengiriman jadwal yang gagal."""
+    if not failures:
+        return
+    extra = load_extra_admins(config.resolved_admins_file)
+    admin_ids = set(config.admin_ids) | extra
+    if not admin_ids:
+        return
+    failed_chat_ids = {cid for cid, _ in failures}
+    detail_lines = "\n".join(
+        f"• <code>{html.escape(str(cid))}</code>: <i>{html.escape(err[:120])}</i>"
+        for cid, err in failures[:5]
+    )
+    alert_text = (
+        f"⚠️ <b>Gagal Kirim Jadwal</b> (<code>{html.escape(job.id)}</code>)\n"
+        f"Nama: <b>{html.escape(job.name)}</b>\n\n"
+        f"{detail_lines}"
+    )
+    for admin_id in sorted(admin_ids):
+        if admin_id in failed_chat_ids:
+            continue
+        try:
+            await bot.send_message(chat_id=admin_id, text=alert_text, parse_mode="HTML")
+        except TelegramError:
+            continue
 
 
 async def send_scheduled_message(
@@ -1083,6 +1152,8 @@ async def send_scheduled_message(
     config: BotConfig | None = None,
     ignore_window: bool = False,
     diagnostics: list[str] | None = None,
+    max_retries: int = 2,
+    retry_delay: float = 1.0,
 ) -> tuple[int, int]:
     """Kirim pesan dari satu ScheduleJob ke semua chat_ids."""
     now = datetime.now(config.tzinfo) if config else datetime.now()
@@ -1094,13 +1165,30 @@ async def send_scheduled_message(
         )
         return 0, 0
 
+    runtime_state: dict[str, Any] | None = None
+    if config is not None and (job.auto_delete_prev or job.require_ack):
+        runtime_state = load_runtime_state(config.resolved_state_file)
+        if not ignore_window and job.require_ack:
+            today_str = now.strftime("%Y-%m-%d")
+            if runtime_state.get("ack_dates", {}).get(job.id) == today_str:
+                logger.info("Melewati job '%s' karena sudah ditandai selesai hari ini (%s)", job.id, today_str)
+                return 0, 0
+
+    expanded_message = render_dynamic_placeholders(job.message, now)
     success = 0
     failed = 0
+    failures: list[tuple[int | str, str]] = []
+    state_changed = False
     numeric_uids = extract_mention_user_ids(
-        job.message,
+        expanded_message,
         mentions=job.mentions,
         saved_targets=saved_targets,
         tag_presets=tag_presets,
+    )
+    ack_markup = (
+        InlineKeyboardMarkup([[InlineKeyboardButton("✅ Sudah Dikerjakan", callback_data=f"ack:done:{job.id}")]])
+        if job.require_ack
+        else None
     )
 
     for chat_id in job.chat_ids:
@@ -1122,7 +1210,7 @@ async def send_scheduled_message(
                     diagnostics.extend(chat_warnings)
 
         final_text = render_message_with_mentions(
-            job.message,
+            expanded_message,
             job.mentions,
             job.parse_mode,
             saved_targets=saved_targets,
@@ -1130,40 +1218,106 @@ async def send_scheduled_message(
             uid_usernames=uid_usernames,
         )
 
-        try:
-            sent_msg: Any = None
-            if job.photo:
-                photo_path = Path(job.photo)
-                if photo_path.exists() and photo_path.is_file():
-                    with photo_path.open("rb") as photo_file:
+        # Anti-spam: hapus pesan pengingat sebelumnya di chat ini jika diaktifkan
+        if job.auto_delete_prev and runtime_state is not None:
+            prev_msg_id = runtime_state.get("last_messages", {}).get(job.id, {}).get(str(chat_id))
+            if isinstance(prev_msg_id, int):
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=prev_msg_id)
+                except TelegramError:
+                    pass
+
+        extra_kwargs: dict[str, Any] = {}
+        if job.thread_id is not None:
+            extra_kwargs["message_thread_id"] = job.thread_id
+        if ack_markup is not None:
+            extra_kwargs["reply_markup"] = ack_markup
+
+        sent_msg: Any = None
+        attempts = max(1, max_retries)
+        for attempt in range(attempts):
+            try:
+                if job.photo:
+                    photo_path = Path(job.photo)
+                    if photo_path.exists() and photo_path.is_file():
+                        with photo_path.open("rb") as photo_file:
+                            sent_msg = await bot.send_photo(
+                                chat_id=chat_id,
+                                photo=photo_file,
+                                caption=final_text or None,
+                                parse_mode=job.parse_mode,
+                                **extra_kwargs,
+                            )
+                    else:
                         sent_msg = await bot.send_photo(
                             chat_id=chat_id,
-                            photo=photo_file,
+                            photo=job.photo,
                             caption=final_text or None,
                             parse_mode=job.parse_mode,
+                            **extra_kwargs,
+                        )
+                elif job.document:
+                    doc_path = Path(job.document)
+                    if doc_path.exists() and doc_path.is_file():
+                        with doc_path.open("rb") as doc_file:
+                            sent_msg = await bot.send_document(
+                                chat_id=chat_id,
+                                document=doc_file,
+                                caption=final_text or None,
+                                parse_mode=job.parse_mode,
+                                **extra_kwargs,
+                            )
+                    else:
+                        sent_msg = await bot.send_document(
+                            chat_id=chat_id,
+                            document=job.document,
+                            caption=final_text or None,
+                            parse_mode=job.parse_mode,
+                            **extra_kwargs,
                         )
                 else:
-                    sent_msg = await bot.send_photo(
+                    sent_msg = await bot.send_message(
                         chat_id=chat_id,
-                        photo=job.photo,
-                        caption=final_text or None,
+                        text=final_text,
                         parse_mode=job.parse_mode,
+                        **extra_kwargs,
                     )
-            else:
-                sent_msg = await bot.send_message(
-                    chat_id=chat_id,
-                    text=final_text,
-                    parse_mode=job.parse_mode,
-                )
+                err_msg = None
+                break
+            except RetryAfter as exc:
+                err_msg = str(exc)
+                if attempt + 1 < attempts:
+                    wait_sec = min(float(getattr(exc, "retry_after", retry_delay)), 5.0)
+                    await asyncio.sleep(max(0.0, wait_sec))
+                else:
+                    logger.error("Gagal mengirim job '%s' ke chat_id=%s (rate-limit): %s", job.id, chat_id, exc)
+            except TelegramError as exc:
+                err_msg = str(exc)
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(max(0.0, retry_delay))
+                else:
+                    logger.error("Gagal mengirim job '%s' ke chat_id=%s: %s", job.id, chat_id, exc)
+
+        if err_msg is None:
             success += 1
             logger.info("Job '%s' terkirim ke chat_id=%s", job.id, chat_id)
+
+            if job.auto_delete_prev and runtime_state is not None and sent_msg is not None:
+                sent_mid = getattr(sent_msg, "message_id", None)
+                if isinstance(sent_mid, int):
+                    runtime_state.setdefault("last_messages", {}).setdefault(job.id, {})[str(chat_id)] = sent_mid
+                    state_changed = True
 
             # Cek apakah Telegram me-strip sebagian tg://user?id= (biasanya karena user tanpa @username & privasi/belum /start)
             remaining_id_links = len(
                 [uid for uid in numeric_uids if uid not in uid_usernames]
             )
             if remaining_id_links > 0 and sent_msg is not None:
-                raw_entities = getattr(sent_msg, "caption_entities", None) if job.photo else getattr(sent_msg, "entities", None)
+                raw_entities = (
+                    getattr(sent_msg, "caption_entities", None)
+                    if (job.photo or job.document)
+                    else getattr(sent_msg, "entities", None)
+                )
                 if isinstance(raw_entities, (list, tuple)):
                     active_text_mentions = sum(1 for e in raw_entities if getattr(e, "type", "") == "text_mention")
                     if active_text_mentions < remaining_id_links:
@@ -1175,10 +1329,9 @@ async def send_scheduled_message(
                         logger.warning("Mention stripped [%s -> %s]: %s", job.id, chat_id, warn_msg)
                         if diagnostics is not None and warn_msg not in diagnostics:
                             diagnostics.append(warn_msg)
-        except TelegramError as exc:
+        else:
             failed += 1
-            err_msg = str(exc)
-            logger.error("Gagal mengirim job '%s' ke chat_id=%s: %s", job.id, chat_id, exc)
+            failures.append((chat_id, err_msg))
 
         if config is not None:
             append_delivery_history(
@@ -1194,6 +1347,12 @@ async def send_scheduled_message(
             )
 
         await asyncio.sleep(0.05)
+
+    if state_changed and config is not None and runtime_state is not None:
+        save_runtime_state(config.resolved_state_file, runtime_state)
+
+    if failures and config is not None and not ignore_window:
+        await _notify_admins_delivery_failure(bot, config, job, failures)
 
     return success, failed
 
@@ -1314,6 +1473,83 @@ def format_main_menu_text(update: Update, config: BotConfig, active_count: int) 
     )
 
 
+def purge_expired_date_jobs(
+    jobs: list[ScheduleJob],
+    tz: Any,
+    now: datetime | None = None,
+) -> tuple[list[ScheduleJob], list[ScheduleJob]]:
+    """Pisahkan jadwal sekali kirim (date) yang waktunya sudah lewat."""
+    current = now or datetime.now(tz)
+    kept: list[ScheduleJob] = []
+    removed: list[ScheduleJob] = []
+    for job in jobs:
+        if job.trigger == "date" and job.run_at:
+            try:
+                if parse_run_at(job.run_at, tz) <= current:
+                    removed.append(job)
+                    continue
+            except ValueError:
+                pass
+        kept.append(job)
+    return kept, removed
+
+
+def duplicate_schedule_job(context: ContextTypes.DEFAULT_TYPE, source_job_id: str) -> ScheduleJob | None:
+    """Duplikat jadwal yang sudah ada dalam 1 klik (status awal dijeda agar aman diedit dulu)."""
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    source = next((j for j in jobs if j.id == source_job_id), None)
+    if not source:
+        return None
+
+    existing_ids = {j.id for j in jobs}
+    base_id = f"{source.id}_copy"
+    new_id = base_id
+    counter = 2
+    while new_id in existing_ids:
+        new_id = f"{base_id}{counter}"
+        counter += 1
+
+    cloned = ScheduleJob(
+        id=new_id,
+        name=f"{source.name[:24]} (Salinan)",
+        trigger=source.trigger,
+        chat_ids=list(source.chat_ids),
+        message=source.message,
+        enabled=False,
+        parse_mode=source.parse_mode,
+        photo=source.photo,
+        document=source.document,
+        thread_id=source.thread_id,
+        auto_delete_prev=source.auto_delete_prev,
+        require_ack=source.require_ack,
+        mentions=list(source.mentions),
+        active_hours=source.active_hours,
+        active_days=list(source.active_days) if source.active_days else None,
+        run_at=source.run_at,
+        cron=source.cron,
+        seconds=source.seconds,
+        minutes=source.minutes,
+        hours=source.hours,
+        days=source.days,
+    )
+    cloned.validate()
+    jobs.append(cloned)
+    save_schedules(config.schedules_file, jobs)
+
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(
+        scheduler,
+        context.bot,
+        jobs,
+        config,
+        context.bot_data.get("known_groups"),
+        context.bot_data.get("tag_presets"),
+    )
+    context.bot_data["jobs"] = jobs
+    return cloned
+
+
 def format_jobs_list_and_keyboard(
     scheduler: AsyncIOScheduler,
     jobs: list[ScheduleJob] | None = None,
@@ -1335,6 +1571,7 @@ def format_jobs_list_and_keyboard(
 
     lines = ["<b>📋 Daftar Jadwal:</b>\n"]
     buttons: list[list[InlineKeyboardButton]] = []
+    expired_count = 0
 
     if display_jobs:
         for job in display_jobs:
@@ -1348,6 +1585,8 @@ def format_jobs_list_and_keyboard(
             else:
                 status_icon = "⚪"
                 next_run = "Sudah lewat"
+                if job.trigger == "date":
+                    expired_count += 1
 
             win_str = ""
             if job.active_hours or job.active_days:
@@ -1385,6 +1624,10 @@ def format_jobs_list_and_keyboard(
                 ]
             )
 
+    if expired_count > 0:
+        buttons.append(
+            [InlineKeyboardButton(f"🧹 Bersihkan Jadwal Kadaluarsa ({expired_count})", callback_data="job:cleanup")]
+        )
     buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -1411,6 +1654,7 @@ def save_new_custom_job(
     custom_msg: str,
     mentions: list[str] | None = None,
     photo: str | None = None,
+    document: str | None = None,
 ) -> ScheduleJob:
     """Buat, simpan ke schedules.json, dan daftarkan jadwal custom baru."""
     config: BotConfig = context.bot_data["config"]
@@ -1438,6 +1682,7 @@ def save_new_custom_job(
         chat_ids=chat_ids,
         message=custom_msg,
         photo=photo,
+        document=document,
         mentions=list(mentions or []),
         active_days=spec.get("active_days"),
         enabled=True,
@@ -1497,10 +1742,12 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     user = update.effective_user
     user_id = user.id if user else "N/A"
+    thread_id = getattr(update.message, "message_thread_id", None)
+    thread_line = f"\n🧵 Topic ID: <code>{thread_id}</code>" if thread_id is not None else ""
     await update.message.reply_html(
         f"🆔 Chat ID: <code>{update.effective_chat.id}</code>\n"
         f"📌 Tipe: <code>{update.effective_chat.type}</code>\n"
-        f"👤 User ID: <code>{user_id}</code>",
+        f"👤 User ID: <code>{user_id}</code>{thread_line}",
         reply_markup=build_back_menu_keyboard(),
     )
 
@@ -1940,8 +2187,9 @@ async def wiz_time_day_apply(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
         f"⏰ Waktu dipilih: <code>{html.escape(spec['label'])}</code>\n\n"
-        "Silakan ketik isi pesan custom yang ingin dikirim otomatis.\n"
-        "<i>Tips: kamu juga bisa langsung tulis <code>@username</code> atau <code>@[Nama](UserID)</code> di dalam pesan!</i>",
+        "Silakan ketik isi pesan custom (atau kirim foto/dokumen) yang ingin dikirim otomatis.\n"
+        "<i>Tips: dukung <code>@username</code>, <code>@[Nama](UserID)</code>, serta variabel dinamis "
+        "<code>{hari}</code>, <code>{tanggal}</code>, <code>{jam}</code>!</i>",
         parse_mode="HTML",
         reply_markup=build_cancel_keyboard(),
     )
@@ -1964,8 +2212,9 @@ async def wiz_datetime_quick(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(
         "<b>✉️ Input Pesan Custom (3/4)</b>\n\n"
         f"⏰ Waktu dipilih: <code>{html.escape(spec['label'])}</code>\n\n"
-        "Silakan ketik isi pesan custom yang ingin dikirim otomatis.\n"
-        "<i>Tips: kamu juga bisa langsung tulis <code>@username</code> atau <code>@[Nama](UserID)</code> di dalam pesan!</i>",
+        "Silakan ketik isi pesan custom (atau kirim foto/dokumen) yang ingin dikirim otomatis.\n"
+        "<i>Tips: dukung <code>@username</code>, <code>@[Nama](UserID)</code>, serta variabel dinamis "
+        "<code>{hari}</code>, <code>{tanggal}</code>, <code>{jam}</code>!</i>",
         parse_mode="HTML",
         reply_markup=build_cancel_keyboard(),
     )
@@ -2002,21 +2251,26 @@ async def wiz_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return ASK_MESSAGE
 
     photo_id: str | None = None
+    document_id: str | None = None
     if update.message.photo:
         photo_id = update.message.photo[-1].file_id
+        custom_msg = (update.message.caption or "").strip()
+    elif update.message.document:
+        document_id = update.message.document.file_id
         custom_msg = (update.message.caption or "").strip()
     elif update.message.text:
         custom_msg = update.message.text.strip()
     else:
         return ASK_MESSAGE
 
-    if not custom_msg and not photo_id:
-        await update.message.reply_text("Pesan atau foto tidak boleh kosong. Kirim pesan/foto:", reply_markup=build_cancel_keyboard())
+    if not custom_msg and not photo_id and not document_id:
+        await update.message.reply_text("Pesan, foto, atau dokumen tidak boleh kosong:", reply_markup=build_cancel_keyboard())
         return ASK_MESSAGE
 
     wiz = context.user_data.setdefault("wiz", {})
     wiz["message"] = custom_msg
     wiz["photo"] = photo_id
+    wiz["document"] = document_id
     wiz["mentions"] = []
 
     candidates = await collect_mention_candidates(context.bot, context.bot_data, wiz.get("chat_ids", []))
@@ -2145,9 +2399,10 @@ async def _show_wiz_confirmation(update: Update, context: ContextTypes.DEFAULT_T
     chat_ids = wiz["chat_ids"]
     custom_msg: str = wiz["message"]
     photo_id: str | None = wiz.get("photo")
+    document_id: str | None = wiz.get("document")
     mentions: list[str] = wiz.get("mentions", [])
     tags_preview = " ".join(mentions) if mentions else "(tidak ada)"
-    photo_line = "🖼️ Foto: <code>Terlampir</code>\n" if photo_id else ""
+    photo_line = "🖼️ Foto: <code>Terlampir</code>\n" if photo_id else ("📎 Dokumen: <code>Terlampir</code>\n" if document_id else "")
 
     keyboard = InlineKeyboardMarkup(
         [
@@ -2199,6 +2454,7 @@ async def wiz_confirm_test_self(update: Update, context: ContextTypes.DEFAULT_TY
         message=wiz["message"],
         mentions=wiz.get("mentions", []),
         photo=wiz.get("photo"),
+        document=wiz.get("document"),
         parse_mode="HTML",
         target_chat_ids=wiz.get("chat_ids", []),
         saved_targets=context.bot_data.get("known_groups"),
@@ -2237,9 +2493,18 @@ async def wiz_confirm_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat_ids: list[int | str] = wiz["chat_ids"]
     custom_msg: str = wiz["message"]
     photo_id: str | None = wiz.get("photo")
+    document_id: str | None = wiz.get("document")
     mentions: list[str] = wiz.get("mentions", [])
 
-    new_job = save_new_custom_job(context, chat_ids, spec, custom_msg, mentions=mentions, photo=photo_id)
+    new_job = save_new_custom_job(
+        context,
+        chat_ids,
+        spec,
+        custom_msg,
+        mentions=mentions,
+        photo=photo_id,
+        document=document_id,
+    )
     tags_label = " ".join(mentions) if mentions else "-"
     keyboard = InlineKeyboardMarkup(
         [
@@ -2334,12 +2599,15 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     status_display = "🟢 Aktif" if matched.enabled else "⏸️ Dijeda (Pause)"
     toggle_label = "⏸️ Pause Jadwal" if matched.enabled else "▶️ Aktifkan Jadwal"
     hours_display = format_active_window(matched.active_hours, matched.active_days)
-    photo_display = "🖼️ Terlampir" if matched.photo else "-"
+    media_display = "🖼️ Foto" if matched.photo else ("📎 Dokumen" if matched.document else "-")
+    thread_display = f"<code>{matched.thread_id}</code>" if matched.thread_id is not None else "General"
+    autodel_label = "🧹 Anti-Spam: ON" if matched.auto_delete_prev else "🧹 Anti-Spam: OFF"
+    ack_label = "✅ Tombol Selesai: ON" if matched.require_ack else "✅ Tombol Selesai: OFF"
 
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("✏️ Ubah Pesan/Foto", callback_data="editact:msg"),
+                InlineKeyboardButton("✏️ Ubah Pesan/Media", callback_data="editact:msg"),
                 InlineKeyboardButton("⏰ Ubah Waktu", callback_data="editact:time"),
             ],
             [
@@ -2348,7 +2616,15 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             ],
             [
                 InlineKeyboardButton("🕒 Jam Operasional", callback_data="editact:hours"),
+                InlineKeyboardButton("🧵 Topic ID", callback_data="editact:thread"),
+            ],
+            [
+                InlineKeyboardButton(autodel_label, callback_data="editact:autodel"),
+                InlineKeyboardButton(ack_label, callback_data="editact:ack"),
+            ],
+            [
                 InlineKeyboardButton(toggle_label, callback_data="editact:toggle"),
+                InlineKeyboardButton("📋 Duplikat Jadwal", callback_data="editact:dup"),
             ],
             [
                 InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
@@ -2364,8 +2640,8 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"📌 <b>Status:</b> {status_display}\n"
         f"⏰ <b>Waktu:</b> <code>{html.escape(describe_job_time(matched))}</code>\n"
         f"🕒 <b>Jam Operasional:</b> <code>{html.escape(hours_display)}</code>\n"
-        f"🎯 <b>Target:</b> <code>{matched.chat_ids}</code>\n"
-        f"🖼️ <b>Foto:</b> {photo_display}\n"
+        f"🎯 <b>Target:</b> <code>{matched.chat_ids}</code> | 🧵 <b>Topic:</b> {thread_display}\n"
+        f"📎 <b>Lampiran:</b> {media_display}\n"
         f"🏷️ <b>Tag:</b> <code>{html.escape(tags_display)}</code>\n"
         f"✉️ <b>Pesan:</b>\n{html.escape(matched.message or '(kosong)')}\n\n"
         "Apa yang ingin kamu ubah?",
@@ -2406,6 +2682,141 @@ async def edit_toggle_enabled(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Refresh tampilan detail jadwal
     query.data = f"editpick:{matched.id}"
     return await edit_show_actions(update, context)
+
+
+async def edit_toggle_autodel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Aktifkan/matikan anti-spam (auto-hapus pesan sebelumnya sebelum kirim baru)."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    if not matched:
+        await query.edit_message_text("Jadwal tidak ditemukan.", reply_markup=build_back_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.auto_delete_prev = not matched.auto_delete_prev
+    save_schedules(config.schedules_file, jobs)
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"), context.bot_data.get("tag_presets"))
+    context.bot_data["jobs"] = jobs
+
+    query.data = f"editpick:{matched.id}"
+    return await edit_show_actions(update, context)
+
+
+async def edit_toggle_ack(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Aktifkan/matikan tombol konfirmasi '✅ Sudah Dikerjakan' di pesan grup."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    if not matched:
+        await query.edit_message_text("Jadwal tidak ditemukan.", reply_markup=build_back_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.require_ack = not matched.require_ack
+    # Reset status selesai hari ini saat toggle ulang agar bisa diuji/dipakai lagi
+    state = load_runtime_state(config.resolved_state_file)
+    if state.get("ack_dates", {}).pop(matched.id, None) is not None:
+        save_runtime_state(config.resolved_state_file, state)
+
+    save_schedules(config.schedules_file, jobs)
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"), context.bot_data.get("tag_presets"))
+    context.bot_data["jobs"] = jobs
+
+    query.data = f"editpick:{matched.id}"
+    return await edit_show_actions(update, context)
+
+
+async def edit_duplicate_job(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Duplikat jadwal terpilih lalu langsung buka menu kelola salinannya."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+
+    target_id = context.user_data.get("edit_job_id", "")
+    cloned = duplicate_schedule_job(context, target_id)
+    if not cloned:
+        await query.answer("Jadwal tidak ditemukan.", show_alert=True)
+        return ConversationHandler.END
+
+    await query.answer(f"📋 Salinan '{cloned.id}' dibuat (status Pause — silakan ubah waktu lalu aktifkan)!", show_alert=True)
+    query.data = f"editpick:{cloned.id}"
+    return await edit_show_actions(update, context)
+
+
+async def edit_ask_thread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Minta Topic / Thread ID untuk grup Forum."""
+    query = update.callback_query
+    if not query:
+        return ConversationHandler.END
+    await query.answer()
+
+    target_id = context.user_data.get("edit_job_id", "")
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    cur = str(matched.thread_id) if (matched and matched.thread_id is not None) else "General (tanpa topic)"
+    await query.edit_message_text(
+        f"<b>🧵 Atur Topic / Thread ID</b> (<code>{html.escape(target_id)}</code>)\n\n"
+        f"Saat ini: <code>{html.escape(cur)}</code>\n\n"
+        "Ketik angka <b>Topic ID</b> dari grup Forum (kirim <code>/chatid</code> di dalam topik tujuan untuk melihat ID-nya), "
+        "atau ketik <code>off</code> untuk mengirim ke General:",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    return EDIT_NEW_THREAD
+
+
+async def edit_save_thread(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.text:
+        return EDIT_NEW_THREAD
+    raw = update.message.text.strip().lower()
+    if raw in ("off", "hapus", "none", "general", "0", "-"):
+        new_thread: int | None = None
+    else:
+        try:
+            new_thread = int(raw)
+            if new_thread <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "Topic ID harus berupa angka positif (contoh: 42) atau ketik 'off' untuk General:",
+                reply_markup=build_cancel_keyboard(),
+            )
+            return EDIT_NEW_THREAD
+
+    target_id = context.user_data.pop("edit_job_id", None)
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == target_id), None)
+    if not matched:
+        await update.message.reply_text("Sesi edit kedaluwarsa. Buka /menu lagi.", reply_markup=build_main_menu_keyboard())
+        return ConversationHandler.END
+
+    matched.thread_id = new_thread
+    save_schedules(config.schedules_file, jobs)
+    scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
+    register_jobs(scheduler, context.bot, jobs, config, context.bot_data.get("known_groups"), context.bot_data.get("tag_presets"))
+    context.bot_data["jobs"] = jobs
+
+    label = str(new_thread) if new_thread is not None else "General (tanpa topic)"
+    await update.message.reply_html(
+        f"<b>✅ Topic ID untuk <code>{matched.id}</code> diperbarui!</b>\n\n"
+        f"🧵 <b>Topic:</b> <code>{html.escape(label)}</code>",
+        reply_markup=build_back_menu_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 async def edit_ask_hours(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2503,7 +2914,8 @@ async def edit_ask_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     target_id = context.user_data.get("edit_job_id", "")
     await query.edit_message_text(
         f"<b>✏️ Input Pesan Custom Baru</b> (<code>{html.escape(target_id)}</code>)\n\n"
-        "Silakan <b>ketik pesan custom baru</b> sekarang (mendukung format HTML seperti <code>&lt;b&gt;tebal&lt;/b&gt;</code>):",
+        "Silakan <b>ketik pesan baru, kirim foto, atau kirim dokumen</b> (mendukung HTML, "
+        "variabel dinamis <code>{hari}</code> <code>{tanggal}</code> <code>{jam}</code>, serta <code>@username</code>):",
         parse_mode="HTML",
         reply_markup=build_cancel_keyboard(),
     )
@@ -2836,16 +3248,20 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return EDIT_NEW_MESSAGE
 
     photo_id: str | None = None
+    document_id: str | None = None
     if update.message.photo:
         photo_id = update.message.photo[-1].file_id
+        new_text = (update.message.caption or "").strip()
+    elif update.message.document:
+        document_id = update.message.document.file_id
         new_text = (update.message.caption or "").strip()
     elif update.message.text:
         new_text = update.message.text.strip()
     else:
         return EDIT_NEW_MESSAGE
 
-    if not new_text and not photo_id:
-        await update.message.reply_text("Pesan atau foto tidak boleh kosong:", reply_markup=build_cancel_keyboard())
+    if not new_text and not photo_id and not document_id:
+        await update.message.reply_text("Pesan, foto, atau dokumen tidak boleh kosong:", reply_markup=build_cancel_keyboard())
         return EDIT_NEW_MESSAGE
 
     target_id = context.user_data.pop("edit_job_id", None)
@@ -2858,6 +3274,7 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     matched.message = new_text
     matched.photo = photo_id
+    matched.document = document_id
     save_schedules(config.schedules_file, jobs)
 
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
@@ -2880,7 +3297,11 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
         ]
     )
-    photo_note = "\n🖼️ <b>Foto baru terlampir!</b>" if photo_id else ""
+    photo_note = (
+        "\n🖼️ <b>Foto baru terlampir!</b>"
+        if photo_id
+        else ("\n📎 <b>Dokumen baru terlampir!</b>" if document_id else "")
+    )
     await update.message.reply_html(
         f"<b>✅ Pesan custom untuk <code>{matched.id}</code> berhasil diperbarui!</b>{photo_note}\n\n"
         f"<b>Pesan baru:</b>\n{html.escape(new_text or '(tanpa teks)')}",
@@ -3262,6 +3683,138 @@ async def send_backup_files(chat_id: int, bot: Bot, config: BotConfig) -> int:
     return sent
 
 
+def restore_backup_file(
+    config: BotConfig,
+    filename: str,
+    raw_bytes: bytes,
+    bot_data: dict[str, Any],
+    bot: Bot | None = None,
+) -> str:
+    """Validasi dan pulihkan satu file backup JSON (schedules/groups/admins/presets)."""
+    clean_name = Path(filename).name.lower()
+    allowed = {"schedules.json", "groups.json", "admins.json", "presets.json"}
+    if clean_name not in allowed:
+        raise ValueError(
+            f"Nama file '{filename}' tidak didukung. Upload salah satu: schedules.json, groups.json, admins.json, atau presets.json."
+        )
+
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"File JSON tidak valid: {exc}") from exc
+
+    scheduler: AsyncIOScheduler | None = bot_data.get("scheduler")
+
+    if clean_name == "schedules.json":
+        if not isinstance(parsed, list):
+            raise ValueError("Format schedules.json harus berupa JSON array.")
+        tmp_path = config.schedules_file.with_suffix(".restore.tmp")
+        try:
+            tmp_path.write_text(json.dumps(parsed, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            validated_jobs = load_schedules(tmp_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        save_schedules(config.schedules_file, validated_jobs)
+        bot_data["jobs"] = validated_jobs
+        if scheduler is not None:
+            register_jobs(
+                scheduler,
+                bot,
+                validated_jobs,
+                config,
+                bot_data.get("known_groups"),
+                bot_data.get("tag_presets"),
+            )
+        return f"schedules.json dipulihkan ({len(validated_jobs)} jadwal)."
+
+    if clean_name == "groups.json":
+        if not isinstance(parsed, dict):
+            raise ValueError("Format groups.json harus berupa JSON object.")
+        save_known_groups(config.resolved_groups_file, parsed)
+        reloaded_groups = load_known_groups(config.resolved_groups_file)
+        bot_data["known_groups"] = reloaded_groups
+        if scheduler is not None:
+            register_jobs(scheduler, bot, bot_data.get("jobs", []), config, reloaded_groups, bot_data.get("tag_presets"))
+        return f"groups.json dipulihkan ({len(reloaded_groups)} target)."
+
+    if clean_name == "admins.json":
+        if not isinstance(parsed, list):
+            raise ValueError("Format admins.json harus berupa JSON array berisi User ID.")
+        restored_admins = {int(x) for x in parsed if isinstance(x, int) or (isinstance(x, str) and x.strip().isdigit())}
+        save_extra_admins(config.resolved_admins_file, restored_admins)
+        bot_data["extra_admins"] = restored_admins
+        return f"admins.json dipulihkan ({len(restored_admins)} admin tambahan)."
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Format presets.json harus berupa JSON object.")
+    cleaned_presets = {
+        str(k): [str(t) for t in v]
+        for k, v in parsed.items()
+        if isinstance(v, list) and v
+    }
+    save_tag_presets(config.resolved_presets_file, cleaned_presets)
+    bot_data["tag_presets"] = cleaned_presets
+    if scheduler is not None:
+        register_jobs(scheduler, bot, bot_data.get("jobs", []), config, bot_data.get("known_groups"), cleaned_presets)
+    return f"presets.json dipulihkan ({len(cleaned_presets)} preset tim)."
+
+
+async def restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Mulai sesi restore backup JSON via tombol atau perintah /restore."""
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+
+    prompt = (
+        "<b>♻️ Restore Backup Konfigurasi</b>\n\n"
+        "Kirim/upload salah satu file JSON hasil backup ke chat ini:\n"
+        "• <code>schedules.json</code>\n"
+        "• <code>groups.json</code>\n"
+        "• <code>admins.json</code>\n"
+        "• <code>presets.json</code>\n\n"
+        "<i>Bot akan memvalidasi format JSON terlebih dahulu sebelum menimpa data saat ini.</i>"
+    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(prompt, parse_mode="HTML", reply_markup=build_cancel_keyboard())
+    elif update.message:
+        await update.message.reply_html(prompt, reply_markup=build_cancel_keyboard())
+    return RESTORE_UPLOAD
+
+
+async def restore_receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message or not update.message.document:
+        if update.message:
+            await update.message.reply_text(
+                "Silakan upload file dokumen JSON (contoh: schedules.json):",
+                reply_markup=build_cancel_keyboard(),
+            )
+        return RESTORE_UPLOAD
+
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return ConversationHandler.END
+
+    doc = update.message.document
+    filename = doc.file_name or ""
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        raw_bytes = bytes(await tg_file.download_as_bytearray())
+        summary = restore_backup_file(config, filename, raw_bytes, context.bot_data, context.bot)
+    except (ValueError, TelegramError) as exc:
+        await update.message.reply_text(f"❌ Restore gagal: {exc}", reply_markup=build_cancel_keyboard())
+        return RESTORE_UPLOAD
+
+    await update.message.reply_html(
+        f"<b>✅ Restore berhasil!</b>\n{html.escape(summary)}",
+        reply_markup=build_back_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_chat:
         return
@@ -3270,9 +3823,15 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await deny_access(update)
         return
     count = await send_backup_files(update.effective_chat.id, context.bot, config)
+    markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("♻️ Restore Backup (Upload JSON)", callback_data="backup:restore")],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
+        ]
+    )
     await update.message.reply_html(
         f"💾 <b>Backup selesai!</b> {count} file konfigurasi telah dikirim.",
-        reply_markup=build_back_menu_keyboard(),
+        reply_markup=markup,
     )
 
 
@@ -3367,13 +3926,51 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     config: BotConfig = context.bot_data["config"]
+    data = query.data
+
+    # Tombol konfirmasi '✅ Sudah Dikerjakan' di grup boleh diklik oleh anggota grup (non-admin sekalipun)
+    if data == "ack:noop":
+        await query.answer("Tugas ini sudah ditandai selesai.")
+        return
+
+    if data.startswith("ack:done:"):
+        job_id = data.split(":", 2)[2]
+        user = update.effective_user
+        actor = extract_chat_title(user) if user else "Anggota"
+        now = datetime.now(config.tzinfo)
+        today_str = now.strftime("%Y-%m-%d")
+
+        state = load_runtime_state(config.resolved_state_file)
+        state.setdefault("ack_dates", {})[job_id] = today_str
+        save_runtime_state(config.resolved_state_file, state)
+
+        append_delivery_history(
+            config.resolved_history_file,
+            {
+                "timestamp": now.strftime("%d/%m %H:%M:%S %Z"),
+                "job_id": job_id,
+                "job_name": f"Selesai oleh {actor}",
+                "chat_id": str(update.effective_chat.id if update.effective_chat else "-"),
+                "status": "ok",
+                "error": f"Ditandai selesai oleh {actor}",
+            },
+        )
+        done_label = f"✅ Dikerjakan oleh {actor[:18]} ({now.strftime('%H:%M')})"
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(done_label, callback_data="ack:noop")]])
+            )
+        except TelegramError:
+            pass
+        await query.answer(f"✅ Ditandai selesai oleh {actor}! Pengingat hari ini dijeda.", show_alert=False)
+        return
+
     if not is_admin(update, config, context.bot_data):
         await deny_access(update)
         return
 
     await query.answer()
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
-    data = query.data
 
     if data == "menu:home":
         text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
@@ -3466,10 +4063,12 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:chatid":
         chat = update.effective_chat
         user = update.effective_user
+        thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
+        thread_line = f"\n🧵 Topic ID: <code>{thread_id}</code>" if thread_id is not None else ""
         await query.edit_message_text(
             f"🆔 Chat ID: <code>{chat.id if chat else 'N/A'}</code>\n"
             f"📌 Tipe: <code>{chat.type if chat else 'N/A'}</code>\n"
-            f"👤 User ID: <code>{user.id if user else 'N/A'}</code>",
+            f"👤 User ID: <code>{user.id if user else 'N/A'}</code>{thread_line}",
             parse_mode="HTML",
             reply_markup=build_back_menu_keyboard(),
         )
@@ -3514,10 +4113,16 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat = update.effective_chat
         if chat:
             count = await send_backup_files(chat.id, context.bot, config)
+            markup = InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("♻️ Restore Backup (Upload JSON)", callback_data="backup:restore")],
+                    [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
+                ]
+            )
             await query.edit_message_text(
                 f"💾 <b>Backup selesai!</b> {count} file konfigurasi telah dikirim ke chat ini.",
                 parse_mode="HTML",
-                reply_markup=build_back_menu_keyboard(),
+                reply_markup=markup,
             )
         return
 
@@ -3573,6 +4178,8 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             message=matched.message,
             mentions=matched.mentions,
             photo=matched.photo,
+            document=matched.document,
+            require_ack=matched.require_ack,
             parse_mode=matched.parse_mode,
             target_chat_ids=matched.chat_ids,
             saved_targets=context.bot_data.get("known_groups"),
@@ -3624,6 +4231,27 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"✅ Terkirim: <b>{success}</b> | ❌ Gagal: <b>{failed}</b>{diag_text}",
             parse_mode="HTML",
             reply_markup=build_back_menu_keyboard(),
+        )
+        return
+
+    if data == "job:cleanup":
+        jobs = context.bot_data.get("jobs", [])
+        kept, removed = purge_expired_date_jobs(jobs, config.tzinfo)
+        save_schedules(config.schedules_file, kept)
+        register_jobs(
+            scheduler,
+            context.bot,
+            kept,
+            config,
+            context.bot_data.get("known_groups"),
+            context.bot_data.get("tag_presets"),
+        )
+        context.bot_data["jobs"] = kept
+        text, markup = format_jobs_list_and_keyboard(scheduler, kept)
+        await query.edit_message_text(
+            f"🧹 <b>{len(removed)}</b> jadwal kadaluarsa berhasil dibersihkan.\n\n{text}",
+            parse_mode="HTML",
+            reply_markup=markup,
         )
         return
 
@@ -3707,6 +4335,7 @@ async def post_init(application: Application) -> None:
             BotCommand("presets", "Kelola preset tim/shift tag"),
             BotCommand("history", "Lihat riwayat pengiriman"),
             BotCommand("backup", "Backup file konfigurasi"),
+            BotCommand("restore", "Restore file JSON backup"),
             BotCommand("admin", "Kelola daftar admin bot"),
             BotCommand("schedule", "Buat jadwal pesan cepat"),
             BotCommand("list", "Lihat daftar jadwal"),
@@ -3793,6 +4422,8 @@ def main() -> None:
             CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$"),
             CallbackQueryHandler(target_add_start, pattern=r"^tgtadd:.+$"),
             CallbackQueryHandler(preset_new_start, pattern=r"^preset:new$"),
+            CallbackQueryHandler(restore_start, pattern=r"^backup:restore$"),
+            CommandHandler("restore", restore_start),
         ],
         states={
             ASK_TARGET: [
@@ -3808,7 +4439,7 @@ def main() -> None:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, wiz_datetime_text),
             ],
             ASK_MESSAGE: [
-                MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), wiz_message_text),
+                MessageHandler(filters.Document.ALL | filters.PHOTO | (filters.TEXT & ~filters.COMMAND), wiz_message_text),
             ],
             ASK_MENTIONS: [
                 CallbackQueryHandler(wiz_mentions_preset, pattern=r"^wiztag:p:\d+$"),
@@ -3829,10 +4460,14 @@ def main() -> None:
                 CallbackQueryHandler(edit_ask_target, pattern=r"^editact:target$"),
                 CallbackQueryHandler(edit_ask_mentions, pattern=r"^editact:mentions$"),
                 CallbackQueryHandler(edit_ask_hours, pattern=r"^editact:hours$"),
+                CallbackQueryHandler(edit_ask_thread, pattern=r"^editact:thread$"),
+                CallbackQueryHandler(edit_toggle_autodel, pattern=r"^editact:autodel$"),
+                CallbackQueryHandler(edit_toggle_ack, pattern=r"^editact:ack$"),
+                CallbackQueryHandler(edit_duplicate_job, pattern=r"^editact:dup$"),
                 CallbackQueryHandler(edit_toggle_enabled, pattern=r"^editact:toggle$"),
             ],
             EDIT_NEW_MESSAGE: [
-                MessageHandler(filters.PHOTO | (filters.TEXT & ~filters.COMMAND), edit_save_message),
+                MessageHandler(filters.Document.ALL | filters.PHOTO | (filters.TEXT & ~filters.COMMAND), edit_save_message),
             ],
             EDIT_NEW_TIME: [
                 CallbackQueryHandler(edit_time_mode, pattern=r"^time:mode:.+$"),
@@ -3856,6 +4491,9 @@ def main() -> None:
                 CallbackQueryHandler(edit_save_hours_quick, pattern=r"^hours:q:.+$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_hours_text),
             ],
+            EDIT_NEW_THREAD: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_save_thread),
+            ],
             ADMIN_ADD_ID: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_save),
             ],
@@ -3869,6 +4507,9 @@ def main() -> None:
                 CallbackQueryHandler(preset_pick_toggle, pattern=r"^prpick:t:\d+$"),
                 CallbackQueryHandler(preset_pick_done, pattern=r"^prpick:done$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, preset_pick_text),
+            ],
+            RESTORE_UPLOAD: [
+                MessageHandler(filters.Document.ALL | (filters.TEXT & ~filters.COMMAND), restore_receive_file),
             ],
         },
         fallbacks=[
