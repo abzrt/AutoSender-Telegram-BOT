@@ -14,6 +14,7 @@ import asyncio
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -85,6 +86,31 @@ class WfmFlowWorker:
         self._page: Any = None
         self._otp_future: asyncio.Future[str] | None = None
         self.waiting_for_otp: bool = False
+        self.session_active: bool = False
+        self.last_keepalive_at: str = "-"
+        self.dispatches_today: int = 0
+        self._dispatch_date: str = ""
+        self._disconnect_notified: bool = False
+
+    def _now_wita(self) -> datetime:
+        return datetime.now(timezone(timedelta(hours=8)))
+
+    def _record_dispatch(self) -> None:
+        today = self._now_wita().strftime("%Y-%m-%d")
+        if self._dispatch_date != today:
+            self._dispatch_date = today
+            self.dispatches_today = 0
+        self.dispatches_today += 1
+
+    def get_status(self) -> dict[str, Any]:
+        today = self._now_wita().strftime("%Y-%m-%d")
+        count = self.dispatches_today if self._dispatch_date == today else 0
+        return {
+            "session_active": self.session_active,
+            "waiting_for_otp": self.waiting_for_otp,
+            "last_keepalive_at": self.last_keepalive_at,
+            "dispatches_today": count,
+        }
 
     def submit_otp(self, code: str) -> bool:
         """Terima kode OTP 6 digit dari perintah /otp Telegram."""
@@ -477,15 +503,23 @@ class WfmFlowWorker:
                 png_bytes = await page.screenshot(type="png")
 
             await self._save_state()
+            self.session_active = True
+            self._disconnect_notified = False
+            self.last_keepalive_at = self._now_wita().strftime("%H:%M WITA")
+            self._record_dispatch()
             card_info["png_bytes"] = png_bytes
             return card_info
 
-    async def keep_alive(self) -> bool:
+    async def keep_alive(
+        self,
+        on_disconnect_cb: Callable[[str], Awaitable[None]] | None = None,
+    ) -> bool:
         """Ping ringan ke FLOW /home setiap 10 menit agar sesi OTP tidak idle-timeout."""
         if self.waiting_for_otp or self._lock.locked():
             return False
         if (not self._page or self._page.is_closed()) and not self.state_file.exists():
             return False
+        was_active = self.session_active
         try:
             async with self._lock:
                 page = await self._ensure_browser()
@@ -496,24 +530,48 @@ class WfmFlowWorker:
                     )
                     if status == 200:
                         await self._save_state()
+                        self.session_active = True
+                        self._disconnect_notified = False
+                        self.last_keepalive_at = self._now_wita().strftime("%H:%M WITA")
                         logger.info("[WFM] Keep-alive OK (fetch /home -> 200)")
                         return True
+                    self.session_active = False
                 elif self.state_file.exists():
                     await page.goto(f"{FLOW_BASE_URL}/home", wait_until="domcontentloaded", timeout=25000)
                     await asyncio.sleep(0.5)
                     if "/home" in page.url.lower():
                         await self._save_state()
+                        self.session_active = True
+                        self._disconnect_notified = False
+                        self.last_keepalive_at = self._now_wita().strftime("%H:%M WITA")
                         logger.info("[WFM] Keep-alive warmup OK (%s)", page.url)
                         return True
+                    self.session_active = False
         except Exception as exc:
             logger.debug("[WFM] Keep-alive skipped: %s", exc)
+            return False
+
+        if was_active and not self.session_active and not self._disconnect_notified and on_disconnect_cb:
+            self._disconnect_notified = True
+            try:
+                await on_disconnect_cb(
+                    "⚠️ <b>Sesi WFM FLOW Terputus!</b>\n\n"
+                    "Keep-alive mendeteksi sesi FLOW di server telah logout.\n"
+                    "Kirim <code>/wo &lt;WONUM&gt;</code> lalu balas <code>/otp &lt;6 digit&gt;</code> agar siap sebelum jam sibuk."
+                )
+            except Exception:
+                pass
         return False
 
-    async def start_keep_alive_loop(self, interval_seconds: int = 600) -> None:
+    async def start_keep_alive_loop(
+        self,
+        interval_seconds: int = 600,
+        on_disconnect_cb: Callable[[str], Awaitable[None]] | None = None,
+    ) -> None:
         """Loop background untuk menjaga sesi FLOW tetap aktif 24/7."""
         # Warmup singkat 15 detik setelah start jika wfm_storage_state.json sudah ada di volume
         await asyncio.sleep(15)
-        await self.keep_alive()
+        await self.keep_alive(on_disconnect_cb=on_disconnect_cb)
         while True:
             await asyncio.sleep(max(120, interval_seconds))
-            await self.keep_alive()
+            await self.keep_alive(on_disconnect_cb=on_disconnect_cb)

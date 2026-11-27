@@ -241,8 +241,11 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu Provisioning (terintegrasi dengan ADING Mobile -> WFM FLOW)."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("📱 ADING Mobile (Auto-Dispatch FLOW)", callback_data="menu:ading")],
-            [InlineKeyboardButton("📡 Tes Pesan 7 Channel Teknisi", callback_data="prov:testchannels")],
+            [InlineKeyboardButton("📱 ADING Mobile & Web (Auto-Dispatch)", callback_data="menu:ading")],
+            [
+                InlineKeyboardButton("🖥️ Status WFM & Channel", callback_data="prov:wfmstatus"),
+                InlineKeyboardButton("📡 Tes 7 Channel", callback_data="prov:testchannels"),
+            ],
             [InlineKeyboardButton("✨ Buat Jadwal Provisioning", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Jadwal Provisioning", callback_data="menu:list:provisioning"),
@@ -265,6 +268,12 @@ def build_ading_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     "⬇️ Download ADING Mobile APK",
                     url="https://github.com/abzrt/ading-android-app/raw/main/Ading%20Mobile.apk",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🌐 Download ADING Web Extension (.zip)",
+                    url="https://github.com/abzrt/ading-android-app/raw/main/ADING-Web-Extension.zip",
                 )
             ],
             [InlineKeyboardButton("🌐 Buka Web ADING (ading.web.id)", url="https://ading.web.id/")],
@@ -4176,6 +4185,47 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if data == "prov:wfmstatus":
+        worker: WfmFlowWorker | None = context.bot_data.get("wfm_worker")
+        st = worker.get_status() if worker else {"session_active": False, "waiting_for_otp": False, "last_keepalive_at": "-", "dispatches_today": 0}
+        if st.get("waiting_for_otp"):
+            ses_lbl = "🟡 Menunggu /otp"
+        elif st.get("session_active"):
+            ses_lbl = "🟢 Aktif (Terkunci 24/7)"
+        else:
+            ses_lbl = "🔴 Belum Login / Butuh /otp"
+
+        known_groups = context.bot_data.get("known_groups", {})
+        ch_lines: list[str] = []
+        for cid_str, info in known_groups.items():
+            ctype = str(info.get("type") or "").lower()
+            if ctype in ("channel", "group", "supergroup") or str(cid_str).startswith("-"):
+                title = html.escape(str(info.get("title") or cid_str))
+                ch_lines.append(f"• {title} (<code>{cid_str}</code>)")
+        ch_preview = "\n".join(ch_lines[:20]) if ch_lines else "<i>Belum ada channel terdeteksi.</i>"
+        if len(ch_lines) > 20:
+            ch_preview += f"\n<i>...dan {len(ch_lines) - 20} channel lainnya.</i>"
+
+        await query.edit_message_text(
+            "<b>🖥️ Status WFM FLOW Standalone</b>\n\n"
+            f"• Sesi FLOW: <b>{ses_lbl}</b>\n"
+            f"• Keep-Alive Terakhir: <code>{html.escape(str(st.get('last_keepalive_at', '-')))}</code>\n"
+            f"• Dispatch Hari Ini: <b>{st.get('dispatches_today', 0)}</b> WO\n"
+            f"• Channel/Grup Terdeteksi: <b>{len(ch_lines)}</b>\n\n"
+            f"<b>Daftar Channel Teknisi:</b>\n{ch_preview}",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Refresh Status", callback_data="prov:wfmstatus")],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
+        )
+        return
+
     if data == "menu:ading":
         chat_id = update.effective_chat.id if update.effective_chat else "N/A"
         thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
@@ -4703,12 +4753,12 @@ def find_matching_technician_channels(
         if cid_str not in candidates:
             candidates[cid_str] = tname
 
-    # Prioritas 1: Cocokkan NIK persis di judul channel
+    # Prioritas 1: Cocokkan NIK persis (batas digit) di judul channel agar aman lintas Witel
     if nik_candidates:
         nik_matches: list[tuple[str, str]] = []
         for cid_str, title in candidates.items():
             for nik in nik_candidates:
-                if nik in title:
+                if re.search(rf"(?<!\d){re.escape(nik)}(?!\d)", title):
                     nik_matches.append((cid_str, title))
                     break
         if nik_matches:
@@ -4739,6 +4789,7 @@ def find_matching_technician_channels(
 def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEventLoop) -> None:
     """Jalankan HTTP bridge ringan di $PORT untuk menerima dispatch SS dari ADING Mobile & Chrome Extension."""
     port = int(os.getenv("PORT", "8080"))
+    expected_api_key = os.getenv("ADING_API_KEY", "ading-wfm-2026-telkom").strip()
 
     class AdingBridgeHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -4757,13 +4808,24 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Ading-Key")
             self.end_headers()
 
         def do_GET(self) -> None:
             if self.path.startswith("/health") or self.path == "/":
                 kg = application.bot_data.get("known_groups", {})
-                self._send_json(200, {"ok": True, "service": "ading-telegram-bridge", "known_chats": len(kg)})
+                worker = application.bot_data.get("wfm_worker")
+                wfm_st = worker.get_status() if worker else {}
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "ading-telegram-bridge",
+                        "known_chats": len(kg),
+                        "wfm_session_active": bool(wfm_st.get("session_active")),
+                        "dispatches_today": int(wfm_st.get("dispatches_today", 0)),
+                    },
+                )
                 return
             self._send_json(404, {"ok": False, "error": "Not found"})
 
@@ -4771,6 +4833,11 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
             if not (self.path.startswith("/api/ading/dispatch") or self.path.startswith("/api/wfm/dispatch")):
                 self._send_json(404, {"ok": False, "error": "Not found"})
                 return
+            if expected_api_key:
+                req_key = (self.headers.get("X-Ading-Key") or "").strip()
+                if req_key != expected_api_key:
+                    self._send_json(401, {"ok": False, "error": "Unauthorized: X-Ading-Key tidak valid"})
+                    return
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(content_len)
@@ -5054,7 +5121,17 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(application: Application) -> None:
     config: BotConfig = application.bot_data["config"]
     application.bot_data["wfm_worker"] = WfmFlowWorker(config.schedules_file.parent)
-    asyncio.create_task(application.bot_data["wfm_worker"].start_keep_alive_loop(600))
+
+    async def _on_wfm_disconnect(msg_html: str) -> None:
+        for adm in (config.admin_ids or {217411824}):
+            try:
+                await application.bot.send_message(chat_id=adm, text=msg_html, parse_mode="HTML")
+            except TelegramError:
+                pass
+
+    asyncio.create_task(
+        application.bot_data["wfm_worker"].start_keep_alive_loop(600, on_disconnect_cb=_on_wfm_disconnect)
+    )
     start_ading_http_bridge(application, asyncio.get_running_loop())
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
