@@ -49,15 +49,24 @@ def unmask_caption_with_flow_data(raw_caption: str, card_info: dict[str, Any]) -
 
 
 def build_flow_summary_caption(wonum: str, card_info: dict[str, Any]) -> str:
-    """Susun caption ringkas jika tidak ada teks Salin ADING (misal dari perintah /wo langsung)."""
+    """Susun caption format standar ADING Mobile jika tidak ada teks Salin ADING (misal dari /wo langsung)."""
+    def _v(key: str, default: str = "-") -> str:
+        val = str(card_info.get(key) or "").strip()
+        return val if val else default
+
     return "\n".join(
         [
-            f"WONUM: {card_info.get('wo') or wonum}",
-            f"NO SC: {card_info.get('sc') or '-'}",
-            f"NO INTERNET: {card_info.get('service_number') or '-'}",
-            f"CUSTOMER NAME: {card_info.get('customer_name') or '-'}",
-            f"CONTACT NUMBER: {card_info.get('contact_number') or '-'}",
-            f"ALAMAT: {card_info.get('service_address') or '-'}",
+            f"NO SC: {_v('sc')}",
+            f"WONUM: {_v('wo', wonum)}",
+            f"BOOKING DATE: {_v('booking_date')}",
+            f"STO: {_v('sto')}",
+            f"PAKET: {_v('paket')}",
+            f"NO INTERNET: {_v('service_number')}",
+            f"CUSTOMER NAME: {_v('customer_name')}",
+            f"CONTACT NUMBER: {_v('contact_number')}",
+            f"ALAMAT: {_v('service_address')}",
+            f"ODP: {_v('odp')}",
+            f"KORDINAT: {_v('koordinat')}",
         ]
     )
 
@@ -339,6 +348,27 @@ class WfmFlowWorker:
 
             await asyncio.sleep(0.3)
 
+            # Tahap 1: Sembunyikan navbar & scroll ke tab Workorder dulu agar paint selesai sebelum ukur clip
+            await page.evaluate(
+                """() => {
+                    document.querySelectorAll('nav, header, .navbar').forEach(n => n.style.display = 'none');
+                    let tabBtnEl = null, redBarEl = null;
+                    for (const sn of document.querySelectorAll('a, button, li, div, label, span, h5, h6')) {
+                        if (sn.children.length > 2) continue;
+                        const st = (sn.innerText || '').trim();
+                        if (!tabBtnEl && (st === 'Related Record' || st === 'Plans')) tabBtnEl = sn;
+                        if (!redBarEl && st === 'Workorder' && sn.getBoundingClientRect().width > 400) redBarEl = sn;
+                    }
+                    const anchorEl = tabBtnEl || redBarEl || document.querySelector('main form');
+                    if (anchorEl) {
+                        const absTop = anchorEl.getBoundingClientRect().top + window.scrollY;
+                        window.scrollTo(0, Math.max(0, absTop - 12));
+                    }
+                }"""
+            )
+            await asyncio.sleep(0.25)
+
+            # Tahap 2: Ekstrak data & hitung koordinat clip setelah scroll benar-benar ter-render
             card_info: dict[str, Any] = await page.evaluate(
                 """() => {
                     function getValByLabel(lbl) {
@@ -369,12 +399,13 @@ class WfmFlowWorker:
 
                     const wo = getValByLabel('Workorder:');
                     const sc = getValByLabel('SC Order No');
+                    const sto = getValByLabel('Workzone');
+                    const bookingDate = getValByLabel('Scheduled Start');
+                    const paket = getValByLabel('Product Name');
                     const srv = getValByLabel('Service Number');
                     const contact = getValByLabel('Contact Number');
                     const cust = getValByLabel('Customer Name');
                     const addr = getValByLabel('Service Address');
-
-                    document.querySelectorAll('nav, header, .navbar').forEach(n => n.style.display = 'none');
 
                     let tabBtnEl = null, redBarEl = null, prodLblEl = null, schedEl = null;
                     for (const sn of document.querySelectorAll('a, button, li, div, label, span, h5, h6')) {
@@ -389,10 +420,8 @@ class WfmFlowWorker:
                     let clip = null;
                     const anchorEl = tabBtnEl || redBarEl || document.querySelector('main form');
                     if (anchorEl) {
-                        const absTop = anchorEl.getBoundingClientRect().top + window.scrollY;
-                        window.scrollTo(0, Math.max(0, absTop - 12));
                         const br = (redBarEl || anchorEl).getBoundingClientRect();
-                        const topY = tabBtnEl ? (tabBtnEl.getBoundingClientRect().top - 8) : (br.top - 8);
+                        const topY = Math.max(0, tabBtnEl ? (tabBtnEl.getBoundingClientRect().top - 8) : (br.top - 8));
                         let botY = br.bottom + 420;
                         if (prodLblEl) {
                             let prodBottom = prodLblEl.getBoundingClientRect().bottom;
@@ -411,12 +440,23 @@ class WfmFlowWorker:
                         const rightX = Math.min(window.innerWidth, br.right + 16);
                         clip = {
                             x: leftX,
-                            y: Math.max(0, topY),
+                            y: topY,
                             width: Math.max(200, rightX - leftX),
-                            height: Math.max(200, botY - Math.max(0, topY)),
+                            height: Math.max(200, Math.min(window.innerHeight - topY, botY - topY)),
                         };
                     }
-                    return { wo, sc, service_number: srv, contact_number: contact, customer_name: cust, service_address: addr, clip };
+                    return {
+                        wo,
+                        sc,
+                        sto,
+                        booking_date: bookingDate,
+                        paket,
+                        service_number: srv,
+                        contact_number: contact,
+                        customer_name: cust,
+                        service_address: addr,
+                        clip,
+                    };
                 }"""
             )
 
