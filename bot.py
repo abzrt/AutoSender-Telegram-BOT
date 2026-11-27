@@ -197,9 +197,9 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Keyboard menu awal bot dengan 3 divisi utama + menu Setting."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("1️⃣ 📦 Provisioning", callback_data="menu:provisioning")],
-            [InlineKeyboardButton("2️⃣ 🛠️ Assurance", callback_data="menu:assurance")],
-            [InlineKeyboardButton("3️⃣ 🔧 Maintenance", callback_data="menu:maintenance")],
+            [InlineKeyboardButton("📦 Provisioning", callback_data="menu:provisioning")],
+            [InlineKeyboardButton("🛠️ Assurance", callback_data="menu:assurance")],
+            [InlineKeyboardButton("🔧 Maintenance", callback_data="menu:maintenance")],
             [InlineKeyboardButton("⚙️ Setting", callback_data="menu:setting")],
         ]
     )
@@ -4160,7 +4160,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         chat_id = update.effective_chat.id if update.effective_chat else "N/A"
         div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "provisioning")
         await query.edit_message_text(
-            "<b>1️⃣ 📦 Menu Provisioning</b>\n\n"
+            "<b>📦 Menu Provisioning</b>\n\n"
             "Terintegrasi dengan aplikasi <b>ADING Mobile → WFM FLOW</b>.\n"
             f"📅 Jadwal tersimpan (Provisioning): <b>{div_count}</b>\n"
             f"🆔 Chat ID aktif: <code>{chat_id}</code>\n\n"
@@ -4303,7 +4303,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data["active_division"] = "assurance"
         div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "assurance")
         await query.edit_message_text(
-            "<b>2️⃣ 🛠️ Menu Assurance</b>\n\n"
+            "<b>🛠️ Menu Assurance</b>\n\n"
             "Kelola jadwal pengingat, target grup, dan laporan operasional divisi <b>Assurance</b>.\n"
             f"📅 Jadwal tersimpan (Assurance): <b>{div_count}</b>\n\n"
             "Pilih menu di bawah ini:",
@@ -4317,7 +4317,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             context.user_data["active_division"] = "maintenance"
         div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "maintenance")
         await query.edit_message_text(
-            "<b>3️⃣ 🔧 Menu Maintenance</b>\n\n"
+            "<b>🔧 Menu Maintenance</b>\n\n"
             "Kelola jadwal pengingat rutin, preset tim, dan target grup divisi <b>Maintenance</b>.\n"
             f"📅 Jadwal tersimpan (Maintenance): <b>{div_count}</b>\n\n"
             "Pilih menu di bawah ini:",
