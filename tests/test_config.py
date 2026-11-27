@@ -183,7 +183,7 @@ def test_main_and_custom_menu_keyboards() -> None:
     assert "menu:provisioning" in main_callbacks
     assert "menu:assurance" in main_callbacks
     assert "menu:maintenance" in main_callbacks
-    assert "menu:autosender" in main_callbacks
+    assert "menu:setting" in main_callbacks
 
     autosender_callbacks = [btn.callback_data for row in build_autosender_menu_keyboard().inline_keyboard for btn in row]
     assert "menu:custom" in autosender_callbacks

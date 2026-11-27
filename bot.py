@@ -171,25 +171,32 @@ def describe_job_time(job: ScheduleJob) -> str:
     return "Interval: setiap " + " ".join(parts)
 
 
+DIVISION_LABELS: dict[str, str] = {
+    "provisioning": "📦 Provisioning",
+    "assurance": "🛠️ Assurance",
+    "maintenance": "🔧 Maintenance",
+}
+
+
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard menu awal bot dengan 3 divisi utama: Provisioning, Assurance, Maintenance."""
+    """Keyboard menu awal bot dengan 3 divisi utama + menu Setting."""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("1️⃣ 📦 Provisioning", callback_data="menu:provisioning")],
             [InlineKeyboardButton("2️⃣ 🛠️ Assurance", callback_data="menu:assurance")],
             [InlineKeyboardButton("3️⃣ 🔧 Maintenance", callback_data="menu:maintenance")],
-            [InlineKeyboardButton("🤖 Menu AutoSender Lengkap", callback_data="menu:autosender")],
+            [InlineKeyboardButton("⚙️ Setting", callback_data="menu:setting")],
         ]
     )
 
 
 def build_autosender_menu_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard lengkap seluruh fitur AutoSender."""
+    """Keyboard menu Setting (kelola semua jadwal, target, preset tim, admin, backup)."""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
             [
-                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📋 Semua Jadwal", callback_data="menu:list"),
                 InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
             ],
             [
@@ -214,9 +221,9 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📱 ADING Mobile (Auto-Dispatch FLOW)", callback_data="menu:ading")],
-            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Provisioning", callback_data="menu:custom")],
+            [InlineKeyboardButton("✨ Buat Jadwal Provisioning", callback_data="menu:custom")],
             [
-                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📋 Jadwal Provisioning", callback_data="menu:list:provisioning"),
                 InlineKeyboardButton("📜 Riwayat Kirim", callback_data="menu:history"),
             ],
             [
@@ -255,9 +262,9 @@ def build_assurance_menu_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu Assurance."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Assurance", callback_data="menu:custom")],
+            [InlineKeyboardButton("✨ Buat Jadwal Assurance", callback_data="menu:custom")],
             [
-                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📋 Jadwal Assurance", callback_data="menu:list:assurance"),
                 InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
             ],
             [
@@ -273,9 +280,9 @@ def build_maintenance_menu_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu Maintenance."""
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Maintenance", callback_data="menu:custom")],
+            [InlineKeyboardButton("✨ Buat Jadwal Maintenance", callback_data="menu:custom")],
             [
-                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📋 Jadwal Maintenance", callback_data="menu:list:maintenance"),
                 InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
             ],
             [
@@ -1617,6 +1624,7 @@ def duplicate_schedule_job(context: ContextTypes.DEFAULT_TYPE, source_job_id: st
         mentions=list(source.mentions),
         active_hours=source.active_hours,
         active_days=list(source.active_days) if source.active_days else None,
+        division=source.division,
         run_at=source.run_at,
         cron=source.cron,
         seconds=source.seconds,
@@ -1644,23 +1652,40 @@ def duplicate_schedule_job(context: ContextTypes.DEFAULT_TYPE, source_job_id: st
 def format_jobs_list_and_keyboard(
     scheduler: AsyncIOScheduler,
     jobs: list[ScheduleJob] | None = None,
+    division: str | None = None,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    """Susun teks daftar jadwal (aktif & dijeda) beserta tombol Edit, Tes, & Hapus."""
+    """Susun teks daftar jadwal (aktif & dijeda) beserta tombol Edit, Tes, & Hapus, opsional difilter per divisi."""
     scheduled_map = {ap_job.id: ap_job for ap_job in scheduler.get_jobs()}
-    display_jobs = jobs if jobs is not None else []
+    all_jobs = jobs if jobs is not None else []
+    div_key = division.strip().lower() if division else None
+    div_label = DIVISION_LABELS.get(div_key, div_key.title()) if div_key else None
+    if div_key:
+        display_jobs = [j for j in all_jobs if (j.division or "").strip().lower() == div_key]
+    else:
+        display_jobs = all_jobs
 
-    if not display_jobs and not scheduled_map:
+    back_cb = f"menu:{div_key}" if div_key in DIVISION_LABELS else "menu:home"
+    back_text = f"⬅️ Kembali ke {div_label}" if div_label else "⬅️ Kembali ke Menu Utama"
+
+    if not display_jobs and (div_key or not scheduled_map):
+        empty_msg = (
+            f"Belum ada jadwal tersimpan untuk divisi <b>{div_label}</b>.\n"
+            "Klik <b>✨ Custom Pesan &amp; Atur Waktu</b> untuk menambahkan."
+            if div_label
+            else "Belum ada jadwal tersimpan.\nKlik <b>✨ Custom Pesan &amp; Atur Waktu</b> untuk menambahkan."
+        )
         return (
-            "Belum ada jadwal tersimpan.\nKlik <b>✨ Custom Pesan &amp; Atur Waktu</b> untuk menambahkan.",
+            empty_msg,
             InlineKeyboardMarkup(
                 [
                     [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
-                    [InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")],
+                    [InlineKeyboardButton(back_text, callback_data=back_cb)],
                 ]
             ),
         )
 
-    lines = ["<b>📋 Daftar Jadwal:</b>\n"]
+    header = f"<b>📋 Daftar Jadwal — {div_label}:</b>\n" if div_label else "<b>📋 Semua Daftar Jadwal:</b>\n"
+    lines = [header]
     buttons: list[list[InlineKeyboardButton]] = []
     expired_count = 0
 
@@ -1682,9 +1707,10 @@ def format_jobs_list_and_keyboard(
             win_str = ""
             if job.active_hours or job.active_days:
                 win_str = f"\n  🕒 Jam aktif: <code>{format_active_window(job.active_hours, job.active_days)}</code>"
+            div_badge = f" [{DIVISION_LABELS[job.division]}]" if (not div_key and job.division in DIVISION_LABELS) else ""
 
             lines.append(
-                f"{status_icon} <b>{html.escape(job.name)}</b> (<code>{job.id}</code>)\n"
+                f"{status_icon} <b>{html.escape(job.name)}</b>{div_badge} (<code>{job.id}</code>)\n"
                 f"  ⏰ Berikutnya: <code>{next_run}</code>{win_str}"
             )
             buttons.append(
@@ -1719,7 +1745,7 @@ def format_jobs_list_and_keyboard(
         buttons.append(
             [InlineKeyboardButton(f"🧹 Bersihkan Jadwal Kadaluarsa ({expired_count})", callback_data="job:cleanup")]
         )
-    buttons.append([InlineKeyboardButton("⬅️ Kembali ke Menu Utama", callback_data="menu:home")])
+    buttons.append([InlineKeyboardButton(back_text, callback_data=back_cb)])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
@@ -1760,6 +1786,14 @@ def save_new_custom_job(
         job_id = f"{base_id}_{counter}"
         counter += 1
 
+    active_division = (
+        str(context.user_data.get("active_division")).strip().lower()
+        if (context.user_data and context.user_data.get("active_division"))
+        else None
+    )
+    if active_division not in DIVISION_LABELS:
+        active_division = None
+
     new_job = ScheduleJob(
         id=job_id,
         name=f"Custom ({spec['label'][:28]})",
@@ -1776,6 +1810,7 @@ def save_new_custom_job(
         document=document,
         mentions=list(mentions or []),
         active_days=spec.get("active_days"),
+        division=active_division,
         enabled=True,
         parse_mode="HTML",
     )
@@ -4064,23 +4099,34 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     scheduler: AsyncIOScheduler = context.bot_data["scheduler"]
 
     if data == "menu:home":
+        if context.user_data is not None:
+            context.user_data["active_division"] = None
         text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
         return
 
-    if data == "menu:autosender":
-        text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_autosender_menu_keyboard())
+    if data in ("menu:setting", "menu:autosender"):
+        if context.user_data is not None:
+            context.user_data["active_division"] = None
+        await query.edit_message_text(
+            "<b>⚙️ Setting — Telegram AutoSender</b>\n\n"
+            f"📅 Total jadwal aktif: <b>{len(scheduler.get_jobs())}</b>\n"
+            "Kelola semua jadwal, target grup, preset tim, admin, dan backup di bawah ini:",
+            parse_mode="HTML",
+            reply_markup=build_autosender_menu_keyboard(),
+        )
         return
 
     if data == "menu:provisioning":
+        if context.user_data is not None:
+            context.user_data["active_division"] = "provisioning"
         chat_id = update.effective_chat.id if update.effective_chat else "N/A"
+        div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "provisioning")
         await query.edit_message_text(
             "<b>1️⃣ 📦 Menu Provisioning</b>\n\n"
             "Terintegrasi dengan aplikasi <b>ADING Mobile → WFM FLOW</b>.\n"
-            "Setiap order yang di-<i>Dispatch</i> di ADING Mobile akan otomatis mengirim "
-            "<b>Screenshot kartu Workorder + Data Salin</b> ke chat tujuan yang diatur.\n\n"
-            f"🆔 Chat ID aktif: <code>{chat_id}</code>\n"
+            f"📅 Jadwal tersimpan (Provisioning): <b>{div_count}</b>\n"
+            f"🆔 Chat ID aktif: <code>{chat_id}</code>\n\n"
             "Pilih menu Provisioning di bawah ini:",
             parse_mode="HTML",
             reply_markup=build_provisioning_menu_keyboard(),
@@ -4126,9 +4172,13 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "menu:assurance":
+        if context.user_data is not None:
+            context.user_data["active_division"] = "assurance"
+        div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "assurance")
         await query.edit_message_text(
             "<b>2️⃣ 🛠️ Menu Assurance</b>\n\n"
             "Kelola jadwal pengingat, target grup, dan laporan operasional divisi <b>Assurance</b>.\n"
+            f"📅 Jadwal tersimpan (Assurance): <b>{div_count}</b>\n\n"
             "Pilih menu di bawah ini:",
             parse_mode="HTML",
             reply_markup=build_assurance_menu_keyboard(),
@@ -4136,9 +4186,13 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if data == "menu:maintenance":
+        if context.user_data is not None:
+            context.user_data["active_division"] = "maintenance"
+        div_count = sum(1 for j in context.bot_data.get("jobs", []) if (j.division or "") == "maintenance")
         await query.edit_message_text(
             "<b>3️⃣ 🔧 Menu Maintenance</b>\n\n"
             "Kelola jadwal pengingat rutin, preset tim, dan target grup divisi <b>Maintenance</b>.\n"
+            f"📅 Jadwal tersimpan (Maintenance): <b>{div_count}</b>\n\n"
             "Pilih menu di bawah ini:",
             parse_mode="HTML",
             reply_markup=build_maintenance_menu_keyboard(),
@@ -4294,8 +4348,13 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
-    if data == "menu:list":
-        text, markup = format_jobs_list_and_keyboard(scheduler, context.bot_data.get("jobs", []))
+    if data == "menu:list" or data.startswith("menu:list:"):
+        div_filter = data.split(":", 2)[2] if data.startswith("menu:list:") else None
+        text, markup = format_jobs_list_and_keyboard(
+            scheduler,
+            context.bot_data.get("jobs", []),
+            division=div_filter,
+        )
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
         return
 

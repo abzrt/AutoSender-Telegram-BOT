@@ -234,6 +234,8 @@ class ScheduleJob:
     # Jam operasional opsional (contoh: active_hours="08:00-17:00", active_days=[1,2,3,4,5])
     active_hours: str | None = None
     active_days: list[int] | None = None
+    # Divisi opsional: "provisioning", "assurance", atau "maintenance"
+    division: str | None = None
     # Date field (digunakan jika trigger == "date")
     run_at: str | None = None
     # Cron field (digunakan jika trigger == "cron")
@@ -317,6 +319,8 @@ class ScheduleJob:
             data["active_hours"] = self.active_hours
         if self.active_days:
             data["active_days"] = self.active_days
+        if self.division:
+            data["division"] = self.division
         data["message"] = self.message
         return data
 
@@ -431,6 +435,7 @@ def load_schedules(path: str | Path) -> list[ScheduleJob]:
             mentions=list(item.get("mentions", [])),
             active_hours=item.get("active_hours"),
             active_days=list(item["active_days"]) if item.get("active_days") else None,
+            division=(str(item["division"]).strip().lower() or None) if item.get("division") else None,
             run_at=item.get("run_at"),
             cron=item.get("cron"),
             seconds=item.get("seconds"),
