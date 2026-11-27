@@ -76,6 +76,7 @@ from config import (
     save_schedules,
     save_tag_presets,
 )
+from wfm_worker import WfmFlowWorker, build_flow_summary_caption, unmask_caption_with_flow_data
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -4767,7 +4768,7 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
             self._send_json(404, {"ok": False, "error": "Not found"})
 
         def do_POST(self) -> None:
-            if not self.path.startswith("/api/ading/dispatch"):
+            if not (self.path.startswith("/api/ading/dispatch") or self.path.startswith("/api/wfm/dispatch")):
                 self._send_json(404, {"ok": False, "error": "Not found"})
                 return
             try:
@@ -4780,28 +4781,50 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                 nama_tim = str(data.get("nama_tim") or "").strip()
                 caption = str(data.get("caption") or "").strip()
                 photo_b64 = str(data.get("photo_base64") or "").strip()
+                wonum = str(data.get("wonum") or "").strip().upper()
                 fallback_cid = str(data.get("fallback_chat_id") or "217411824").strip()
-                if not photo_b64:
-                    self._send_json(400, {"ok": False, "error": "photo_base64 required"})
+                is_standalone_wfm = self.path.startswith("/api/wfm/dispatch") or (not photo_b64 and bool(wonum))
+
+                if not is_standalone_wfm and not photo_b64:
+                    self._send_json(400, {"ok": False, "error": "photo_base64 atau wonum wajib diisi"})
                     return
-                png_bytes = base64.b64decode(photo_b64)
-
-                known_groups = application.bot_data.get("known_groups", {})
-                matched = find_matching_technician_channels(known_groups, leader_name, leader_nik, nama_tim)
-
-                # Tambahkan @mention jika ada
-                hay_upper = f"{leader_name} {nama_tim}".upper()
-                mentions = [m for k, m in ADING_TECH_MENTIONS.items() if k in hay_upper]
-                final_caption = f"{caption}\n\n👷 {' '.join(mentions)}" if mentions else caption
-                if len(final_caption) > 1020:
-                    final_caption = final_caption[:1020]
 
                 async def _dispatch_async() -> dict[str, Any]:
+                    nonlocal caption
+                    if is_standalone_wfm:
+                        worker: WfmFlowWorker = application.bot_data["wfm_worker"]
+
+                        async def _notify_admin_otp(msg_html: str) -> None:
+                            for adm in (application.bot_data["config"].admin_ids or {int(fallback_cid)}):
+                                try:
+                                    await application.bot.send_message(chat_id=adm, text=msg_html, parse_mode="HTML")
+                                except TelegramError:
+                                    pass
+
+                        card = await worker.capture_workorder(wonum, _notify_admin_otp)
+                        png_bytes_local = card["png_bytes"]
+                        caption = (
+                            unmask_caption_with_flow_data(caption, card)
+                            if caption
+                            else build_flow_summary_caption(wonum, card)
+                        )
+                    else:
+                        png_bytes_local = base64.b64decode(photo_b64)
+
+                    known_groups = application.bot_data.get("known_groups", {})
+                    matched = find_matching_technician_channels(known_groups, leader_name, leader_nik, nama_tim)
+
+                    hay_upper = f"{leader_name} {nama_tim}".upper()
+                    mentions = [m for k, m in ADING_TECH_MENTIONS.items() if k in hay_upper]
+                    final_caption = f"{caption}\n\n👷 {' '.join(mentions)}" if mentions else caption
+                    if len(final_caption) > 1020:
+                        final_caption = final_caption[:1020]
+
                     sent_to: list[str] = []
                     matched_titles: list[str] = []
                     for cid_str, title in matched:
                         try:
-                            bio = io.BytesIO(png_bytes)
+                            bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
                             await application.bot.send_photo(chat_id=int(cid_str), photo=bio, caption=final_caption)
                             sent_to.append(cid_str)
@@ -4818,7 +4841,7 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                             f"{final_caption}"
                         )[:1020]
                         try:
-                            bio = io.BytesIO(png_bytes)
+                            bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
                             await application.bot.send_photo(chat_id=int(fallback_cid), photo=bio, caption=fb_cap)
                             sent_to.append(fallback_cid)
@@ -4835,7 +4858,7 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                     }
 
                 fut = asyncio.run_coroutine_threadsafe(_dispatch_async(), loop)
-                res = fut.result(timeout=30)
+                res = fut.result(timeout=210 if is_standalone_wfm else 30)
                 self._send_json(200 if res.get("ok") else 502, res)
             except Exception as exc:
                 logger.exception("Error di /api/ading/dispatch")
@@ -4855,9 +4878,84 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
 # ==================== LIFECYCLE & CLI ====================
 
 
+async def cmd_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Masukkan 6 digit kode OTP untuk WFM FLOW Standalone Worker."""
+    if not update.message:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    worker: WfmFlowWorker | None = context.bot_data.get("wfm_worker")
+    code = " ".join(context.args or []).strip()
+    if not code:
+        await update.message.reply_html("Gunakan format: <code>/otp 123456</code>")
+        return
+    if worker and worker.submit_otp(code):
+        await update.message.reply_html("✅ Kode OTP diterima! Melanjutkan proses WFM FLOW...")
+    else:
+        await update.message.reply_html("ℹ️ Saat ini tidak ada sesi WFM FLOW yang sedang menunggu OTP.")
+
+
+async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Standalone ambil SS HD Workorder langsung dari WFM FLOW: /wo WO069272106 [opsional: nama/NIK teknisi]."""
+    if not update.message or not update.effective_chat:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    args = context.args or []
+    if not args:
+        await update.message.reply_html(
+            "<b>🖥️ WFM FLOW Standalone</b>\n\n"
+            "Gunakan:\n"
+            "• <code>/wo WO069272106</code> — ambil SS HD &amp; kirim ke chat ini\n"
+            "• <code>/wo WO069272106 ARIFIN</code> — ambil SS HD &amp; kirim otomatis ke channel teknisi"
+        )
+        return
+    wonum = args[0].strip().upper()
+    tech_query = " ".join(args[1:]).strip()
+    worker: WfmFlowWorker = context.bot_data["wfm_worker"]
+    chat_id = update.effective_chat.id
+
+    status_msg = await update.message.reply_html(f"⏳ Mengambil SS HD <b>{html.escape(wonum)}</b> dari WFM FLOW...")
+
+    async def _notify_otp(msg_html: str) -> None:
+        await context.bot.send_message(chat_id=chat_id, text=msg_html, parse_mode="HTML")
+
+    try:
+        card = await worker.capture_workorder(wonum, _notify_otp)
+        caption = build_flow_summary_caption(wonum, card)
+        bio = io.BytesIO(card["png_bytes"])
+        bio.name = f"{wonum}.png"
+
+        if tech_query:
+            known_groups = context.bot_data.get("known_groups", {})
+            matched = find_matching_technician_channels(known_groups, tech_query, tech_query, tech_query)
+            if matched:
+                sent_titles: list[str] = []
+                for cid_str, title in matched:
+                    b2 = io.BytesIO(card["png_bytes"])
+                    b2.name = f"{wonum}.png"
+                    await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
+                    sent_titles.append(title)
+                await status_msg.edit_text(
+                    f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
+                    parse_mode="HTML",
+                )
+                return
+
+        await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+        await status_msg.delete()
+    except Exception as exc:
+        await status_msg.edit_text(f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+
+
 async def post_init(application: Application) -> None:
-    start_ading_http_bridge(application, asyncio.get_running_loop())
     config: BotConfig = application.bot_data["config"]
+    application.bot_data["wfm_worker"] = WfmFlowWorker(config.schedules_file.parent)
+    start_ading_http_bridge(application, asyncio.get_running_loop())
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
     default_divisions = {
@@ -5130,6 +5228,8 @@ def main() -> None:
     application.add_handler(CommandHandler("list", cmd_list))
     application.add_handler(CommandHandler("test", cmd_test))
     application.add_handler(CommandHandler("reload", cmd_reload))
+    application.add_handler(CommandHandler("otp", cmd_otp))
+    application.add_handler(CommandHandler("wo", cmd_wo))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
 
     logger.info("Menjalankan Telegram AutoSender Bot...")
