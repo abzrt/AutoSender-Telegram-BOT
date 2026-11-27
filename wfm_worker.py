@@ -196,22 +196,44 @@ class WfmFlowWorker:
                 self._otp_future = None
 
             otp_inp = page.locator("#otp, input[name='otp']").first
+            await otp_inp.click()
             await otp_inp.fill(otp_code)
-            sign_btn = page.locator("#signInButton, button[type='submit']").first
-            await sign_btn.click()
+            await otp_inp.dispatch_event("input")
+            await otp_inp.dispatch_event("change")
 
-            # Tunggu redirect pasca OTP selesai
-            for _ in range(30):
+            sign_btn = page.locator("#signInButton, button:has-text('Sign In'), button[type='submit']").first
+            if await sign_btn.count() > 0:
+                await sign_btn.click()
+            else:
+                await otp_inp.press("Enter")
+
+            # Tunggu sampai benar-benar keluar dari /otp (jangan potong saat masih di /otp)
+            otp_verified = False
+            last_swal = ""
+            for _ in range(40):
                 await asyncio.sleep(0.5)
-                if "/otp" not in page.url.lower():
+                cur_u = page.url.lower()
+                if "/otp" not in cur_u and "/unauthorize" not in cur_u and cur_u.rstrip("/") != FLOW_BASE_URL:
+                    otp_verified = True
                     break
                 try:
-                    has_menus = await page.evaluate("() => !!localStorage.getItem('menus')")
-                    if has_menus:
-                        break
+                    swal_txt = await page.evaluate(
+                        "() => ((document.querySelector('.swal2-html-container, .swal2-content, .swal2-title') || {}).innerText || '').trim()"
+                    )
+                    if swal_txt:
+                        last_swal = swal_txt
+                        low = swal_txt.lower()
+                        if any(k in low for k in ("salah", "invalid", "expired", "gagal", "error")):
+                            raise RuntimeError(f"OTP ditolak oleh FLOW: {swal_txt}")
+                except RuntimeError:
+                    raise
                 except Exception:
                     continue
 
+            if not otp_verified:
+                raise RuntimeError(f"Verifikasi OTP belum berhasil keluar dari /otp (URL: {page.url}, pesan: {last_swal or '-'}). Coba lagi.")
+
+            await asyncio.sleep(0.5)
             await self._save_state()
 
     async def capture_workorder(
