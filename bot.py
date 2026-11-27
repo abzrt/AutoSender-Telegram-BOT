@@ -172,7 +172,19 @@ def describe_job_time(job: ScheduleJob) -> str:
 
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Keyboard menu utama bot."""
+    """Keyboard menu awal bot dengan 3 divisi utama: Provisioning, Assurance, Maintenance."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("1️⃣ 📦 Provisioning", callback_data="menu:provisioning")],
+            [InlineKeyboardButton("2️⃣ 🛠️ Assurance", callback_data="menu:assurance")],
+            [InlineKeyboardButton("3️⃣ 🔧 Maintenance", callback_data="menu:maintenance")],
+            [InlineKeyboardButton("🤖 Menu AutoSender Lengkap", callback_data="menu:autosender")],
+        ]
+    )
+
+
+def build_autosender_menu_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard lengkap seluruh fitur AutoSender."""
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✨ Custom Pesan & Atur Waktu", callback_data="menu:custom")],
@@ -192,6 +204,61 @@ def build_main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🆔 Cek Chat ID", callback_data="menu:chatid"),
                 InlineKeyboardButton("🔄 Reload", callback_data="menu:reload"),
             ],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
+        ]
+    )
+
+
+def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
+    """Sub-menu Provisioning (terintegrasi dengan ADING Mobile -> WFM FLOW)."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Provisioning", callback_data="menu:custom")],
+            [
+                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📜 Riwayat Kirim", callback_data="menu:history"),
+            ],
+            [
+                InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
+                InlineKeyboardButton("🆔 Cek Chat ID / Topic", callback_data="menu:chatid"),
+            ],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
+        ]
+    )
+
+
+def build_assurance_menu_keyboard() -> InlineKeyboardMarkup:
+    """Sub-menu Assurance."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Assurance", callback_data="menu:custom")],
+            [
+                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
+            ],
+            [
+                InlineKeyboardButton("👥 Preset Tim", callback_data="menu:presets"),
+                InlineKeyboardButton("📜 Riwayat Kirim", callback_data="menu:history"),
+            ],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
+        ]
+    )
+
+
+def build_maintenance_menu_keyboard() -> InlineKeyboardMarkup:
+    """Sub-menu Maintenance."""
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ Custom Pesan & Jadwal Maintenance", callback_data="menu:custom")],
+            [
+                InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
+                InlineKeyboardButton("📇 Kelola Target", callback_data="menu:targets"),
+            ],
+            [
+                InlineKeyboardButton("👥 Preset Tim", callback_data="menu:presets"),
+                InlineKeyboardButton("📜 Riwayat Kirim", callback_data="menu:history"),
+            ],
+            [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
         ]
     )
 
@@ -3975,6 +4042,45 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "menu:home":
         text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_main_menu_keyboard())
+        return
+
+    if data == "menu:autosender":
+        text = format_main_menu_text(update, config, len(scheduler.get_jobs()))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=build_autosender_menu_keyboard())
+        return
+
+    if data == "menu:provisioning":
+        chat_id = update.effective_chat.id if update.effective_chat else "N/A"
+        await query.edit_message_text(
+            "<b>1️⃣ 📦 Menu Provisioning</b>\n\n"
+            "Terintegrasi dengan aplikasi <b>ADING Mobile → WFM FLOW</b>.\n"
+            "Setiap order yang di-<i>Dispatch</i> di ADING Mobile akan otomatis mengirim "
+            "<b>Screenshot kartu Workorder + Data Salin</b> ke chat tujuan yang diatur.\n\n"
+            f"🆔 Chat ID aktif: <code>{chat_id}</code>\n"
+            "Pilih menu Provisioning di bawah ini:",
+            parse_mode="HTML",
+            reply_markup=build_provisioning_menu_keyboard(),
+        )
+        return
+
+    if data == "menu:assurance":
+        await query.edit_message_text(
+            "<b>2️⃣ 🛠️ Menu Assurance</b>\n\n"
+            "Kelola jadwal pengingat, target grup, dan laporan operasional divisi <b>Assurance</b>.\n"
+            "Pilih menu di bawah ini:",
+            parse_mode="HTML",
+            reply_markup=build_assurance_menu_keyboard(),
+        )
+        return
+
+    if data == "menu:maintenance":
+        await query.edit_message_text(
+            "<b>3️⃣ 🔧 Menu Maintenance</b>\n\n"
+            "Kelola jadwal pengingat rutin, preset tim, dan target grup divisi <b>Maintenance</b>.\n"
+            "Pilih menu di bawah ini:",
+            parse_mode="HTML",
+            reply_markup=build_maintenance_menu_keyboard(),
+        )
         return
 
     if data == "menu:targets":
