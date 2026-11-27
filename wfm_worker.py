@@ -268,34 +268,59 @@ class WfmFlowWorker:
         async with self._lock:
             page = await self._ensure_browser()
             target_url = f"{FLOW_EDIT_WO_URL}{clean_wo}"
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(0.7)
 
+            # Buka /home dulu agar sesi & Referer selalu valid (jangan langsung cold-goto /EditWorkorder)
             cur = page.url.lower()
-            logger.info("[WFM] Initial goto %s -> %s", target_url, page.url)
-            if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur:
+            if not any(p in cur for p in ("/home", "/dashboard", "/workorder", "/editworkorder")):
+                await page.goto(f"{FLOW_BASE_URL}/home", wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(0.8)
+                cur = page.url.lower()
+                logger.info("[WFM] Check /home -> %s", page.url)
+
+            if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur or "about:blank" in cur:
                 await self._perform_login_and_otp(page, notify_otp_cb)
+
+            # Sekarang sudah pasti di halaman terautentikasi (/home). Gunakan #searchWonum dulu seperti user asli.
+            opened_via_search = False
+            try:
+                search_inp = page.locator("#searchWonum").first
+                if await search_inp.count() > 0:
+                    await search_inp.click()
+                    await search_inp.fill(clean_wo)
+                    await search_inp.press("Enter")
+                    for _ in range(16):
+                        await asyncio.sleep(0.5)
+                        if "/editworkorder" in page.url.lower():
+                            opened_via_search = True
+                            break
+                        if "/unauthorize" in page.url.lower():
+                            break
+                    logger.info("[WFM] After #searchWonum(%s) -> %s (ok=%s)", clean_wo, page.url, opened_via_search)
+            except Exception as srch_exc:
+                logger.warning("[WFM] #searchWonum error: %s", srch_exc)
+
+            # Jika belum masuk ke /EditWorkorder/<WO>, navigasi dengan Referer dari /home
+            if not opened_via_search and "/editworkorder" not in page.url.lower():
                 try:
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(
+                        target_url,
+                        wait_until="domcontentloaded",
+                        referer=f"{FLOW_BASE_URL}/home",
+                        timeout=30000,
+                    )
                 except Exception as nav_exc:
                     if "ERR_ABORTED" in str(nav_exc):
                         await asyncio.sleep(1.5)
-                        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                        await page.goto(
+                            target_url,
+                            wait_until="domcontentloaded",
+                            referer=f"{FLOW_BASE_URL}/home",
+                            timeout=30000,
+                        )
                     else:
                         raise
                 await asyncio.sleep(0.8)
-                logger.info("[WFM] Post-login goto %s -> %s", target_url, page.url)
-                if "/unauthorize" in page.url.lower():
-                    # Fallback: buka /home dan cari lewat #searchWonum (global search FLOW)
-                    await page.goto(f"{FLOW_BASE_URL}/home", wait_until="domcontentloaded", timeout=30000)
-                    await asyncio.sleep(1.0)
-                    logger.info("[WFM] Fallback /home -> %s", page.url)
-                    search_inp = page.locator("#searchWonum").first
-                    if await search_inp.count() > 0:
-                        await search_inp.fill(clean_wo)
-                        await search_inp.press("Enter")
-                        await asyncio.sleep(2.5)
-                        logger.info("[WFM] After #searchWonum -> %s", page.url)
+                logger.info("[WFM] Referer goto %s -> %s", target_url, page.url)
 
             # Tunggu kartu Workorder selesai render
             card_ready = False

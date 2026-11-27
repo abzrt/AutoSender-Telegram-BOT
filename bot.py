@@ -4950,7 +4950,12 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
             await status_msg.delete()
         except Exception as exc:
-            await status_msg.edit_text(f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+            err_html = f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>"
+            try:
+                await status_msg.delete()
+            except TelegramError:
+                pass
+            await context.bot.send_message(chat_id=chat_id, text=err_html, parse_mode="HTML")
 
     asyncio.create_task(_run_wo_task())
 
