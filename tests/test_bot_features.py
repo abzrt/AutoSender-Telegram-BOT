@@ -500,3 +500,32 @@ def test_duplicate_cleanup_and_restore_backup(tmp_path) -> None:
     with pytest.raises(ValueError, match="tidak didukung"):
         restore_backup_file(cfg, "random.txt", b"{}", bot_data)
 
+
+
+@pytest.mark.anyio
+async def test_wo_anti_spam_deletes_previous_message(tmp_path) -> None:
+    from bot import extract_wo_key, replace_previous_wo_messages
+
+    assert extract_wo_key("wo069272106") == "WO069272106"
+    assert extract_wo_key("", "NO SC: 123\nWONUM: WO069325687\nALAMAT: Test") == "WO069325687"
+
+    fake_bot = AsyncMock()
+    # Kiriman pertama: tidak ada yang dihapus
+    deleted1 = await replace_previous_wo_messages(
+        fake_bot,
+        tmp_path,
+        "WO069272106",
+        [{"chat_id": -1002202217652, "message_id": 101}],
+    )
+    assert deleted1 == 0
+    fake_bot.delete_message.assert_not_called()
+
+    # Kiriman kedua untuk WONUM yang sama: pesan lama (101) otomatis dihapus
+    deleted2 = await replace_previous_wo_messages(
+        fake_bot,
+        tmp_path,
+        "WO069272106",
+        [{"chat_id": -1002202217652, "message_id": 202}],
+    )
+    assert deleted2 == 1
+    fake_bot.delete_message.assert_awaited_once_with(chat_id=-1002202217652, message_id=101)

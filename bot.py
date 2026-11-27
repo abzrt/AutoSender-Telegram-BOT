@@ -4822,13 +4822,15 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
 
                     sent_to: list[str] = []
                     matched_titles: list[str] = []
+                    sent_records: list[dict[str, int]] = []
                     for cid_str, title in matched:
                         try:
                             bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
-                            await application.bot.send_photo(chat_id=int(cid_str), photo=bio, caption=final_caption)
+                            sent_msg = await application.bot.send_photo(chat_id=int(cid_str), photo=bio, caption=final_caption)
                             sent_to.append(cid_str)
                             matched_titles.append(title)
+                            sent_records.append({"chat_id": int(cid_str), "message_id": sent_msg.message_id})
                         except TelegramError as exc:
                             logger.warning("Gagal kirim ke channel %s (%s): %s", title, cid_str, exc)
 
@@ -4843,18 +4845,30 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                         try:
                             bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
-                            await application.bot.send_photo(chat_id=int(fallback_cid), photo=bio, caption=fb_cap)
+                            sent_msg = await application.bot.send_photo(chat_id=int(fallback_cid), photo=bio, caption=fb_cap)
                             sent_to.append(fallback_cid)
                             matched_titles.append("Fallback Chat")
+                            sent_records.append({"chat_id": int(fallback_cid), "message_id": sent_msg.message_id})
                             used_fallback = True
                         except TelegramError as exc:
                             logger.error("Fallback send gagal: %s", exc)
+
+                    deleted_prev = 0
+                    wo_key = extract_wo_key(wonum, final_caption)
+                    if sent_records and wo_key:
+                        deleted_prev = await replace_previous_wo_messages(
+                            application.bot,
+                            application.bot_data["config"].schedules_file.parent,
+                            wo_key,
+                            sent_records,
+                        )
 
                     return {
                         "ok": len(sent_to) > 0,
                         "sent_to": sent_to,
                         "matched_titles": matched_titles,
                         "fallback": used_fallback,
+                        "deleted_previous": deleted_prev,
                     }
 
                 fut = asyncio.run_coroutine_threadsafe(_dispatch_async(), loop)
@@ -4873,6 +4887,69 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
             logger.warning("Gagal menjalankan ADING HTTP Bridge di port %s: %s", port, exc)
 
     threading.Thread(target=_serve, daemon=True).start()
+
+
+# ==================== WO ANTI-SPAM (AUTO-DELETE DUPLICATE) ====================
+
+
+def extract_wo_key(wonum: str, caption: str = "") -> str:
+    """Ambil kunci WONUM unik (contoh: WO069272106) untuk anti-spam auto-delete kiriman lama."""
+    clean = (wonum or "").strip().upper()
+    if clean:
+        return clean
+    m = re.search(r"\bWO\d{6,}\b", (caption or "").upper())
+    return m.group(0) if m else ""
+
+
+async def replace_previous_wo_messages(
+    bot: Any,
+    state_dir: Path,
+    wo_key: str,
+    new_sent: list[dict[str, int]],
+) -> int:
+    """Hapus otomatis kiriman Telegram sebelumnya untuk WONUM yang sama, lalu simpan message_id terbaru."""
+    if not wo_key or not new_sent:
+        return 0
+    store_path = state_dir / "wo_dispatch_messages.json"
+    data: dict[str, list[dict[str, int]]] = {}
+    if store_path.exists():
+        try:
+            loaded = json.loads(store_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    new_pairs = {(int(r["chat_id"]), int(r["message_id"])) for r in new_sent}
+    prev_list = data.pop(wo_key, [])
+    deleted = 0
+    if isinstance(prev_list, list):
+        for item in prev_list:
+            try:
+                cid = int(item["chat_id"])
+                mid = int(item["message_id"])
+            except Exception:
+                continue
+            if (cid, mid) in new_pairs:
+                continue
+            try:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+                deleted += 1
+            except TelegramError:
+                pass
+
+    data[wo_key] = [{"chat_id": int(r["chat_id"]), "message_id": int(r["message_id"])} for r in new_sent]
+    # Batasi maksimal 500 WONUM terakhir agar file tetap ringan
+    if len(data) > 500:
+        keys_to_drop = list(data.keys())[:-500]
+        for k in keys_to_drop:
+            data.pop(k, None)
+    try:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Gagal menyimpan wo_dispatch_messages.json: %s", exc)
+    return deleted
 
 
 # ==================== LIFECYCLE & CLI ====================
@@ -4936,18 +5013,32 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 matched = find_matching_technician_channels(known_groups, tech_query, tech_query, tech_query)
                 if matched:
                     sent_titles: list[str] = []
+                    sent_records: list[dict[str, int]] = []
                     for cid_str, title in matched:
                         b2 = io.BytesIO(card["png_bytes"])
                         b2.name = f"{wonum}.png"
-                        await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
+                        sent_msg = await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
                         sent_titles.append(title)
+                        sent_records.append({"chat_id": int(cid_str), "message_id": sent_msg.message_id})
+                    await replace_previous_wo_messages(
+                        context.bot,
+                        config.schedules_file.parent,
+                        wonum,
+                        sent_records,
+                    )
                     await status_msg.edit_text(
                         f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
                         parse_mode="HTML",
                     )
                     return
 
-            await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            sent_msg = await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            await replace_previous_wo_messages(
+                context.bot,
+                config.schedules_file.parent,
+                wonum,
+                [{"chat_id": chat_id, "message_id": sent_msg.message_id}],
+            )
             await status_msg.delete()
         except Exception as exc:
             err_html = f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>"
