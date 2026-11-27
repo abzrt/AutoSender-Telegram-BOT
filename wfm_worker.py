@@ -207,13 +207,13 @@ class WfmFlowWorker:
             else:
                 await otp_inp.press("Enter")
 
-            # Tunggu sampai benar-benar keluar dari /otp (jangan potong saat masih di /otp)
+            # Tunggu sampai benar-benar masuk ke /home atau /dashboard setelah OTP
             otp_verified = False
             last_swal = ""
             for _ in range(40):
                 await asyncio.sleep(0.5)
                 cur_u = page.url.lower()
-                if "/otp" not in cur_u and "/unauthorize" not in cur_u and cur_u.rstrip("/") != FLOW_BASE_URL:
+                if any(p in cur_u for p in ("/home", "/dashboard", "/workorder", "/editworkorder")):
                     otp_verified = True
                     break
                 try:
@@ -233,7 +233,26 @@ class WfmFlowWorker:
             if not otp_verified:
                 raise RuntimeError(f"Verifikasi OTP belum berhasil keluar dari /otp (URL: {page.url}, pesan: {last_swal or '-'}). Coba lagi.")
 
-            await asyncio.sleep(0.5)
+            # Tunggu /home selesai memuat sesi & localStorage.menus sebelum pindah ke /EditWorkorder
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+            has_menus = False
+            for _ in range(16):
+                try:
+                    has_menus = bool(await page.evaluate("() => Boolean(localStorage.getItem('menus'))"))
+                    if has_menus:
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)
+
+            try:
+                cookies_cnt = len(await self._context.cookies()) if self._context else 0
+            except Exception:
+                cookies_cnt = -1
+            logger.info("[WFM] Post-OTP ready: url=%s cookies=%d has_menus=%s", page.url, cookies_cnt, has_menus)
             await self._save_state()
 
     async def capture_workorder(
@@ -253,6 +272,7 @@ class WfmFlowWorker:
             await asyncio.sleep(0.7)
 
             cur = page.url.lower()
+            logger.info("[WFM] Initial goto %s -> %s", target_url, page.url)
             if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur:
                 await self._perform_login_and_otp(page, notify_otp_cb)
                 try:
@@ -263,6 +283,19 @@ class WfmFlowWorker:
                         await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
                     else:
                         raise
+                await asyncio.sleep(0.8)
+                logger.info("[WFM] Post-login goto %s -> %s", target_url, page.url)
+                if "/unauthorize" in page.url.lower():
+                    # Fallback: buka /home dan cari lewat #searchWonum (global search FLOW)
+                    await page.goto(f"{FLOW_BASE_URL}/home", wait_until="domcontentloaded", timeout=30000)
+                    await asyncio.sleep(1.0)
+                    logger.info("[WFM] Fallback /home -> %s", page.url)
+                    search_inp = page.locator("#searchWonum").first
+                    if await search_inp.count() > 0:
+                        await search_inp.fill(clean_wo)
+                        await search_inp.press("Enter")
+                        await asyncio.sleep(2.5)
+                        logger.info("[WFM] After #searchWonum -> %s", page.url)
 
             # Tunggu kartu Workorder selesai render
             card_ready = False
