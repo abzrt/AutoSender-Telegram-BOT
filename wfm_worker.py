@@ -255,7 +255,14 @@ class WfmFlowWorker:
             cur = page.url.lower()
             if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur:
                 await self._perform_login_and_otp(page, notify_otp_cb)
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as nav_exc:
+                    if "ERR_ABORTED" in str(nav_exc):
+                        await asyncio.sleep(1.5)
+                        await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                    else:
+                        raise
 
             # Tunggu kartu Workorder selesai render
             card_ready = False

@@ -4924,32 +4924,35 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async def _notify_otp(msg_html: str) -> None:
         await context.bot.send_message(chat_id=chat_id, text=msg_html, parse_mode="HTML")
 
-    try:
-        card = await worker.capture_workorder(wonum, _notify_otp)
-        caption = build_flow_summary_caption(wonum, card)
-        bio = io.BytesIO(card["png_bytes"])
-        bio.name = f"{wonum}.png"
+    async def _run_wo_task() -> None:
+        try:
+            card = await worker.capture_workorder(wonum, _notify_otp)
+            caption = build_flow_summary_caption(wonum, card)
+            bio = io.BytesIO(card["png_bytes"])
+            bio.name = f"{wonum}.png"
 
-        if tech_query:
-            known_groups = context.bot_data.get("known_groups", {})
-            matched = find_matching_technician_channels(known_groups, tech_query, tech_query, tech_query)
-            if matched:
-                sent_titles: list[str] = []
-                for cid_str, title in matched:
-                    b2 = io.BytesIO(card["png_bytes"])
-                    b2.name = f"{wonum}.png"
-                    await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
-                    sent_titles.append(title)
-                await status_msg.edit_text(
-                    f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
-                    parse_mode="HTML",
-                )
-                return
+            if tech_query:
+                known_groups = context.bot_data.get("known_groups", {})
+                matched = find_matching_technician_channels(known_groups, tech_query, tech_query, tech_query)
+                if matched:
+                    sent_titles: list[str] = []
+                    for cid_str, title in matched:
+                        b2 = io.BytesIO(card["png_bytes"])
+                        b2.name = f"{wonum}.png"
+                        await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
+                        sent_titles.append(title)
+                    await status_msg.edit_text(
+                        f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
+                        parse_mode="HTML",
+                    )
+                    return
 
-        await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
-        await status_msg.delete()
-    except Exception as exc:
-        await status_msg.edit_text(f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+            await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            await status_msg.delete()
+        except Exception as exc:
+            await status_msg.edit_text(f"❌ Gagal mengambil <b>{html.escape(wonum)}</b>:\n<code>{html.escape(str(exc))}</code>", parse_mode="HTML")
+
+    asyncio.create_task(_run_wo_task())
 
 
 async def post_init(application: Application) -> None:
