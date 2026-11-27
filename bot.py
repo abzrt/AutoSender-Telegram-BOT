@@ -187,6 +187,11 @@ ADING_TECH_CHANNELS: dict[str, str] = {
     "ALIF JUNAIDI": "-1002975699950",
 }
 
+ADING_TECH_MENTIONS: dict[str, str] = {
+    "ARIFIN": "@Mimpi_bergadang",
+    "ANJELLO": "@embu_mamo_SK",
+}
+
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Keyboard menu awal bot dengan 3 divisi utama + menu Setting."""
@@ -231,6 +236,7 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📱 ADING Mobile (Auto-Dispatch FLOW)", callback_data="menu:ading")],
+            [InlineKeyboardButton("📡 Tes Pesan 7 Channel Teknisi", callback_data="prov:testchannels")],
             [InlineKeyboardButton("✨ Buat Jadwal Provisioning", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Jadwal Provisioning", callback_data="menu:list:provisioning"),
@@ -4181,6 +4187,54 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             "Gunakan tombol di bawah untuk download APK terbaru atau test koneksi:",
             parse_mode="HTML",
             reply_markup=build_ading_menu_keyboard(),
+        )
+        return
+
+    if data == "prov:testchannels":
+        await query.edit_message_text(
+            "⏳ <b>Mengirim pesan tes ke 7 channel teknisi...</b>",
+            parse_mode="HTML",
+        )
+        ok_count = 0
+        result_lines = ["<b>📡 Hasil Tes Kirim 7 Channel Teknisi:</b>\n"]
+        for tech_name, ch_id in ADING_TECH_CHANNELS.items():
+            mention = ADING_TECH_MENTIONS.get(tech_name, "")
+            mention_line = f"\n👷 {mention}" if mention else ""
+            msg_text = (
+                "✅ <b>Tes Koneksi Bot Auto-Dispatch ADING Mobile</b>\n"
+                f"Channel Teknisi: <b>{html.escape(tech_name)}</b>\n"
+                f"Status: Terhubung &amp; siap menerima order WFM FLOW.{mention_line}"
+            )
+            try:
+                sent_msg = await context.bot.send_message(
+                    chat_id=int(ch_id),
+                    text=msg_text,
+                    parse_mode="HTML",
+                )
+                ok_count += 1
+                ch_title = sent_msg.chat.title or tech_name
+                result_lines.append(
+                    f"✅ <b>{html.escape(tech_name)}</b> (<code>{ch_id}</code>)\n"
+                    f"   └ {html.escape(ch_title)} • msg #{sent_msg.message_id}"
+                )
+            except TelegramError as exc:
+                result_lines.append(
+                    f"❌ <b>{html.escape(tech_name)}</b> (<code>{ch_id}</code>)\n"
+                    f"   └ <i>{html.escape(str(exc))}</i>"
+                )
+        result_lines.append(f"\n<b>Total Berhasil: {ok_count}/{len(ADING_TECH_CHANNELS)}</b>")
+        await query.edit_message_text(
+            "\n".join(result_lines),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🔄 Tes Ulang 7 Channel", callback_data="prov:testchannels")],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
         )
         return
 
