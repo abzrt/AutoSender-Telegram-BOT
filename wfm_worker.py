@@ -167,9 +167,12 @@ class WfmFlowWorker:
                 if any(p in cur_url for p in ("/home", "/dashboard", "/workorder")):
                     await self._save_state()
                     return
-                err_txt = await page.evaluate(
-                    "() => ((document.querySelector('.swal2-html-container, .swal2-content') || {}).innerText || '')"
-                )
+                try:
+                    err_txt = await page.evaluate(
+                        "() => ((document.querySelector('.swal2-html-container, .swal2-content') || {}).innerText || '')"
+                    )
+                except Exception:
+                    continue
                 if "password salah" in err_txt.lower():
                     raise RuntimeError(f"Password FLOW salah untuk akun {self.flow_user}! Update env FLOW_PASS.")
 
@@ -202,9 +205,12 @@ class WfmFlowWorker:
                 await asyncio.sleep(0.5)
                 if "/otp" not in page.url.lower():
                     break
-                has_menus = await page.evaluate("() => !!localStorage.getItem('menus')")
-                if has_menus:
-                    break
+                try:
+                    has_menus = await page.evaluate("() => !!localStorage.getItem('menus')")
+                    if has_menus:
+                        break
+                except Exception:
+                    continue
 
             await self._save_state()
 
@@ -232,10 +238,13 @@ class WfmFlowWorker:
             # Tunggu kartu Workorder selesai render
             card_ready = False
             for _ in range(30):
-                txt = await page.evaluate("() => (document.body && document.body.innerText) || ''")
-                if any(k in txt for k in ("OSS Order ID", "Service Number", "Customer Name")):
-                    card_ready = True
-                    break
+                try:
+                    txt = await page.evaluate("() => (document.body && document.body.innerText) || ''")
+                    if any(k in txt for k in ("OSS Order ID", "Service Number", "Customer Name")):
+                        card_ready = True
+                        break
+                except Exception:
+                    pass
                 await asyncio.sleep(0.4)
 
             if not card_ready:
