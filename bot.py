@@ -213,6 +213,7 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu Provisioning (terintegrasi dengan ADING Mobile -> WFM FLOW)."""
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("📱 ADING Mobile (Auto-Dispatch FLOW)", callback_data="menu:ading")],
             [InlineKeyboardButton("✨ Custom Pesan & Jadwal Provisioning", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Daftar Jadwal", callback_data="menu:list"),
@@ -223,6 +224,29 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🆔 Cek Chat ID / Topic", callback_data="menu:chatid"),
             ],
             [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
+        ]
+    )
+
+
+def build_ading_menu_keyboard() -> InlineKeyboardMarkup:
+    """Sub-menu khusus integrasi ADING Mobile di dalam Provisioning."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "⬇️ Download ADING Mobile APK",
+                    url="https://github.com/abzrt/ading-android-app/raw/main/Ading%20Mobile.apk",
+                )
+            ],
+            [InlineKeyboardButton("🌐 Buka Web ADING (ading.web.id)", url="https://ading.web.id/")],
+            [
+                InlineKeyboardButton("🧪 Test Kirim ADING", callback_data="ading:test"),
+                InlineKeyboardButton("🆔 Cek Chat / Topic ID", callback_data="menu:chatid"),
+            ],
+            [
+                InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+            ],
         ]
     )
 
@@ -4061,6 +4085,44 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML",
             reply_markup=build_provisioning_menu_keyboard(),
         )
+        return
+
+    if data == "menu:ading":
+        chat_id = update.effective_chat.id if update.effective_chat else "N/A"
+        thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
+        thread_line = f"\n🧵 Topic/Thread ID: <code>{thread_id}</code>" if thread_id is not None else ""
+        await query.edit_message_text(
+            "<b>📱 ADING Mobile — Auto-Dispatch WFM FLOW</b>\n\n"
+            "<b>Alur Otomatis:</b>\n"
+            "1. Klik <b>Dispatch / Redispatch</b> di aplikasi ADING Mobile\n"
+            "2. Aplikasi otomatis klik <b>Salin</b> &amp; ambil <b>WONUM</b>\n"
+            "3. Aplikasi buka <b>FLOW Telkom Akses</b> (sesi OTP tersimpan di background)\n"
+            "4. Crop kartu <b>Workorder</b> &amp; kirim otomatis <b>SS + Data Salin</b> ke Telegram ini\n\n"
+            "<b>Konfigurasi Tujuan Chat Ini:</b>\n"
+            f"🆔 Chat ID: <code>{chat_id}</code>{thread_line}\n"
+            "🤖 Bot: <code>@biarndalupa_bot</code>\n\n"
+            "Gunakan tombol di bawah untuk download APK terbaru atau test koneksi:",
+            parse_mode="HTML",
+            reply_markup=build_ading_menu_keyboard(),
+        )
+        return
+
+    if data == "ading:test":
+        chat = update.effective_chat
+        if chat:
+            thread_id = getattr(query.message, "message_thread_id", None) if query.message else None
+            send_kwargs: dict[str, Any] = {
+                "chat_id": chat.id,
+                "text": (
+                    "✅ <b>Test Integrasi ADING Mobile → Provisioning Berhasil!</b>\n\n"
+                    f"🆔 Chat ID: <code>{chat.id}</code>\n"
+                    "Bot siap menerima kirim otomatis <b>SS Workorder FLOW + Data Salin</b> dari ADING Mobile."
+                ),
+                "parse_mode": "HTML",
+            }
+            if thread_id is not None:
+                send_kwargs["message_thread_id"] = thread_id
+            await context.bot.send_message(**send_kwargs)
         return
 
     if data == "menu:assurance":
