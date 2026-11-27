@@ -2753,6 +2753,11 @@ async def edit_show_actions(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 InlineKeyboardButton("📋 Duplikat Jadwal", callback_data="editact:dup"),
             ],
             [
+                InlineKeyboardButton("📦 Ke Provisioning", callback_data="editdiv:provisioning"),
+                InlineKeyboardButton("🛠️ Ke Assurance", callback_data="editdiv:assurance"),
+                InlineKeyboardButton("🔧 Ke Maintenance", callback_data="editdiv:maintenance"),
+            ],
+            [
                 InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
                 InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
             ],
@@ -3165,6 +3170,11 @@ async def _apply_edited_target(
     keyboard = InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("📦 Ke Provisioning", callback_data="editdiv:provisioning"),
+                InlineKeyboardButton("🛠️ Ke Assurance", callback_data="editdiv:assurance"),
+                InlineKeyboardButton("🔧 Ke Maintenance", callback_data="editdiv:maintenance"),
+            ],
+            [
                 InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
                 InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
             ],
@@ -3352,6 +3362,11 @@ async def _apply_edited_mentions(
     keyboard = InlineKeyboardMarkup(
         [
             [
+                InlineKeyboardButton("📦 Ke Provisioning", callback_data="editdiv:provisioning"),
+                InlineKeyboardButton("🛠️ Ke Assurance", callback_data="editdiv:assurance"),
+                InlineKeyboardButton("🔧 Ke Maintenance", callback_data="editdiv:maintenance"),
+            ],
+            [
                 InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
                 InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
             ],
@@ -3416,6 +3431,11 @@ async def edit_save_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     keyboard = InlineKeyboardMarkup(
         [
+            [
+                InlineKeyboardButton("📦 Ke Provisioning", callback_data="editdiv:provisioning"),
+                InlineKeyboardButton("🛠️ Ke Assurance", callback_data="editdiv:assurance"),
+                InlineKeyboardButton("🔧 Ke Maintenance", callback_data="editdiv:maintenance"),
+            ],
             [
                 InlineKeyboardButton("👤 Tes ke Diri Sendiri", callback_data=f"job:testself:{matched.id}"),
                 InlineKeyboardButton("🚀 Tes ke Target", callback_data=f"job:test:{matched.id}"),
@@ -4505,6 +4525,38 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
+async def edit_set_division(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query or not query.data:
+        return ConversationHandler.END
+    await query.answer()
+    target_div = query.data.split(":", 1)[1].strip().lower()
+    if target_div not in DIVISION_LABELS:
+        return EDIT_ACTION
+    job_id = context.user_data.get("edit_job_id") if context.user_data else None
+    config: BotConfig = context.bot_data["config"]
+    jobs: list[ScheduleJob] = context.bot_data.get("jobs", [])
+    matched = next((j for j in jobs if j.id == job_id), None)
+    if not matched:
+        await query.edit_message_text("Jadwal tidak ditemukan.", reply_markup=build_main_menu_keyboard())
+        return ConversationHandler.END
+    matched.division = target_div
+    save_schedules(config.schedules_file, jobs)
+    context.bot_data["jobs"] = jobs
+    await query.edit_message_text(
+        f"✅ Jadwal <b>{html.escape(matched.name)}</b> (<code>{matched.id}</code>) "
+        f"berhasil dipindahkan ke divisi <b>{DIVISION_LABELS[target_div]}</b>!",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(f"📋 Lihat Jadwal {DIVISION_LABELS[target_div]}", callback_data=f"menu:list:{target_div}")],
+                [InlineKeyboardButton("⬅️ Kembali ke Menu Awal", callback_data="menu:home")],
+            ]
+        ),
+    )
+    return ConversationHandler.END
+
+
 # ==================== LIFECYCLE & CLI ====================
 
 
@@ -4512,6 +4564,20 @@ async def post_init(application: Application) -> None:
     config: BotConfig = application.bot_data["config"]
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
+    default_divisions = {
+        "custom_20261123_1319": "assurance",
+        "custom_20261123_1438": "provisioning",
+        "custom_20261123_1731": "maintenance",
+        "custom_20261125_1730": "maintenance",
+        "custom_20261125_1737": "maintenance",
+    }
+    divisions_migrated = False
+    for job in jobs:
+        if not job.division and job.id in default_divisions:
+            job.division = default_divisions[job.id]
+            divisions_migrated = True
+    if divisions_migrated:
+        save_schedules(config.schedules_file, jobs)
     extra_admins = load_extra_admins(config.resolved_admins_file)
     known_groups = load_known_groups(config.resolved_groups_file)
     known_members = load_known_members(config.resolved_members_file)
@@ -4692,6 +4758,7 @@ def main() -> None:
                 CallbackQueryHandler(edit_toggle_ack, pattern=r"^editact:ack$"),
                 CallbackQueryHandler(edit_duplicate_job, pattern=r"^editact:dup$"),
                 CallbackQueryHandler(edit_toggle_enabled, pattern=r"^editact:toggle$"),
+                CallbackQueryHandler(edit_set_division, pattern=r"^editdiv:(provisioning|assurance|maintenance)$"),
             ],
             EDIT_NEW_MESSAGE: [
                 MessageHandler(filters.Document.ALL | filters.PHOTO | (filters.TEXT & ~filters.COMMAND), edit_save_message),
