@@ -13,11 +13,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import html
+import io
 import json
 import logging
+import os
 import re
+import threading
 from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -4664,10 +4669,194 @@ async def edit_set_division(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+def find_matching_technician_channels(
+    known_groups: dict[str, dict[str, str]],
+    leader_name: str = "",
+    leader_nik: str = "",
+    nama_tim: str = "",
+) -> list[tuple[str, str]]:
+    """Cari otomatis channel/grup teknisi dari known_groups berdasarkan NIK atau Nama Teknisi."""
+    nik_candidates: list[str] = []
+    clean_nik = re.sub(r"\D+", "", leader_nik or "")
+    if len(clean_nik) >= 5:
+        nik_candidates.append(clean_nik)
+    for m in re.findall(r"\b\d{5,12}\b", nama_tim or ""):
+        if m not in nik_candidates:
+            nik_candidates.append(m)
+
+    raw_name = (leader_name or "").strip()
+    if not raw_name and nama_tim:
+        raw_name = nama_tim.split("(")[0].strip()
+    name_upper = re.sub(r"[^A-Z0-9\s]", " ", raw_name.upper())
+    stop_words = {"MUHAMMAD", "MUH", "MOH", "AHMAD", "ANDI", "BIN", "TIM", "TEAM", "SNY", "NNK", "TRK", "KLT"}
+    all_tokens = [w for w in name_upper.split() if len(w) >= 3]
+    distinct_tokens = [w for w in all_tokens if w not in stop_words] or all_tokens
+
+    # Gabungkan known_groups + seed channel yang sudah dikenal
+    candidates: dict[str, str] = {}
+    for cid_str, info in (known_groups or {}).items():
+        ctype = str(info.get("type") or "").lower()
+        if ctype in ("channel", "group", "supergroup") or str(cid_str).startswith("-"):
+            candidates[str(cid_str)] = str(info.get("title") or "")
+    for tname, cid_str in ADING_TECH_CHANNELS.items():
+        if cid_str not in candidates:
+            candidates[cid_str] = tname
+
+    # Prioritas 1: Cocokkan NIK persis di judul channel
+    if nik_candidates:
+        nik_matches: list[tuple[str, str]] = []
+        for cid_str, title in candidates.items():
+            for nik in nik_candidates:
+                if nik in title:
+                    nik_matches.append((cid_str, title))
+                    break
+        if nik_matches:
+            return nik_matches
+
+    # Prioritas 2: Cocokkan nama teknisi di judul channel
+    if all_tokens:
+        scored: list[tuple[int, str, str]] = []
+        for cid_str, title in candidates.items():
+            t_clean = re.sub(r"[^A-Z0-9\s]", " ", title.upper())
+            t_words = set(t_clean.split())
+            if name_upper.strip() and name_upper.strip() in t_clean:
+                scored.append((100, cid_str, title))
+                continue
+            distinct_hits = sum(1 for w in distinct_tokens if w in t_words or w in t_clean)
+            if distinct_hits >= 2 or (len(distinct_tokens) == 1 and distinct_hits == 1):
+                scored.append((50 + distinct_hits * 10, cid_str, title))
+            elif distinct_hits == 1 and any(len(w) >= 5 and w in t_words for w in distinct_tokens):
+                scored.append((30, cid_str, title))
+        if scored:
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_score = scored[0][0]
+            return [(cid, title) for sc, cid, title in scored if sc == top_score]
+
+    return []
+
+
+def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEventLoop) -> None:
+    """Jalankan HTTP bridge ringan di $PORT untuk menerima dispatch SS dari ADING Mobile & Chrome Extension."""
+    port = int(os.getenv("PORT", "8080"))
+
+    class AdingBridgeHandler(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: Any) -> None:
+            logger.info("HTTP %s", format % args)
+
+        def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            if self.path.startswith("/health") or self.path == "/":
+                kg = application.bot_data.get("known_groups", {})
+                self._send_json(200, {"ok": True, "service": "ading-telegram-bridge", "known_chats": len(kg)})
+                return
+            self._send_json(404, {"ok": False, "error": "Not found"})
+
+        def do_POST(self) -> None:
+            if not self.path.startswith("/api/ading/dispatch"):
+                self._send_json(404, {"ok": False, "error": "Not found"})
+                return
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(content_len)
+                data = json.loads(raw.decode("utf-8"))
+
+                leader_name = str(data.get("leader_name") or "").strip()
+                leader_nik = str(data.get("leader_nik") or "").strip()
+                nama_tim = str(data.get("nama_tim") or "").strip()
+                caption = str(data.get("caption") or "").strip()
+                photo_b64 = str(data.get("photo_base64") or "").strip()
+                fallback_cid = str(data.get("fallback_chat_id") or "217411824").strip()
+                if not photo_b64:
+                    self._send_json(400, {"ok": False, "error": "photo_base64 required"})
+                    return
+                png_bytes = base64.b64decode(photo_b64)
+
+                known_groups = application.bot_data.get("known_groups", {})
+                matched = find_matching_technician_channels(known_groups, leader_name, leader_nik, nama_tim)
+
+                # Tambahkan @mention jika ada
+                hay_upper = f"{leader_name} {nama_tim}".upper()
+                mentions = [m for k, m in ADING_TECH_MENTIONS.items() if k in hay_upper]
+                final_caption = f"{caption}\n\n👷 {' '.join(mentions)}" if mentions else caption
+                if len(final_caption) > 1020:
+                    final_caption = final_caption[:1020]
+
+                async def _dispatch_async() -> dict[str, Any]:
+                    sent_to: list[str] = []
+                    matched_titles: list[str] = []
+                    for cid_str, title in matched:
+                        try:
+                            bio = io.BytesIO(png_bytes)
+                            bio.name = "workorder.png"
+                            await application.bot.send_photo(chat_id=int(cid_str), photo=bio, caption=final_caption)
+                            sent_to.append(cid_str)
+                            matched_titles.append(title)
+                        except TelegramError as exc:
+                            logger.warning("Gagal kirim ke channel %s (%s): %s", title, cid_str, exc)
+
+                    used_fallback = False
+                    if not sent_to and fallback_cid:
+                        tech_label = leader_name or nama_tim or leader_nik or "Teknisi"
+                        fb_cap = (
+                            f"⚠️ Channel teknisi ({tech_label}) belum ditemukan / bot belum Admin.\n"
+                            f"Masukkan @biarndalupa_bot sebagai Admin di channel teknisi (judul memuat Nama/NIK).\n\n"
+                            f"{final_caption}"
+                        )[:1020]
+                        try:
+                            bio = io.BytesIO(png_bytes)
+                            bio.name = "workorder.png"
+                            await application.bot.send_photo(chat_id=int(fallback_cid), photo=bio, caption=fb_cap)
+                            sent_to.append(fallback_cid)
+                            matched_titles.append("Fallback Chat")
+                            used_fallback = True
+                        except TelegramError as exc:
+                            logger.error("Fallback send gagal: %s", exc)
+
+                    return {
+                        "ok": len(sent_to) > 0,
+                        "sent_to": sent_to,
+                        "matched_titles": matched_titles,
+                        "fallback": used_fallback,
+                    }
+
+                fut = asyncio.run_coroutine_threadsafe(_dispatch_async(), loop)
+                res = fut.result(timeout=30)
+                self._send_json(200 if res.get("ok") else 502, res)
+            except Exception as exc:
+                logger.exception("Error di /api/ading/dispatch")
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+    def _serve() -> None:
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", port), AdingBridgeHandler)
+            logger.info("ADING Auto-Discovery HTTP Bridge aktif di port %s", port)
+            server.serve_forever()
+        except Exception as exc:
+            logger.warning("Gagal menjalankan ADING HTTP Bridge di port %s: %s", port, exc)
+
+    threading.Thread(target=_serve, daemon=True).start()
+
+
 # ==================== LIFECYCLE & CLI ====================
 
 
 async def post_init(application: Application) -> None:
+    start_ading_http_bridge(application, asyncio.get_running_loop())
     config: BotConfig = application.bot_data["config"]
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
@@ -4925,7 +5114,7 @@ def main() -> None:
 
     # Passive tracker grup/channel agar daftar grup selalu up-to-date otomatis
     application.add_handler(ChatMemberHandler(track_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER), group=-1)
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_activity), group=-1)
+    application.add_handler(MessageHandler(filters.ChatType.GROUPS | filters.ChatType.CHANNEL, track_group_activity), group=-1)
 
     application.add_handler(wizard_handler)
     application.add_handler(CommandHandler(["start", "help", "menu"], cmd_menu))
