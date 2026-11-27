@@ -4963,6 +4963,7 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def post_init(application: Application) -> None:
     config: BotConfig = application.bot_data["config"]
     application.bot_data["wfm_worker"] = WfmFlowWorker(config.schedules_file.parent)
+    asyncio.create_task(application.bot_data["wfm_worker"].start_keep_alive_loop(600))
     start_ading_http_bridge(application, asyncio.get_running_loop())
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)

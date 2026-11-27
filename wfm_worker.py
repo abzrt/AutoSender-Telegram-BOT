@@ -479,3 +479,41 @@ class WfmFlowWorker:
             await self._save_state()
             card_info["png_bytes"] = png_bytes
             return card_info
+
+    async def keep_alive(self) -> bool:
+        """Ping ringan ke FLOW /home setiap 10 menit agar sesi OTP tidak idle-timeout."""
+        if self.waiting_for_otp or self._lock.locked():
+            return False
+        if (not self._page or self._page.is_closed()) and not self.state_file.exists():
+            return False
+        try:
+            async with self._lock:
+                page = await self._ensure_browser()
+                cur = page.url.lower()
+                if any(p in cur for p in ("/home", "/dashboard", "/workorder", "/editworkorder")):
+                    status = await page.evaluate(
+                        "() => fetch('/home', {credentials: 'include'}).then(r => r.status).catch(() => 0)"
+                    )
+                    if status == 200:
+                        await self._save_state()
+                        logger.info("[WFM] Keep-alive OK (fetch /home -> 200)")
+                        return True
+                elif self.state_file.exists():
+                    await page.goto(f"{FLOW_BASE_URL}/home", wait_until="domcontentloaded", timeout=25000)
+                    await asyncio.sleep(0.5)
+                    if "/home" in page.url.lower():
+                        await self._save_state()
+                        logger.info("[WFM] Keep-alive warmup OK (%s)", page.url)
+                        return True
+        except Exception as exc:
+            logger.debug("[WFM] Keep-alive skipped: %s", exc)
+        return False
+
+    async def start_keep_alive_loop(self, interval_seconds: int = 600) -> None:
+        """Loop background untuk menjaga sesi FLOW tetap aktif 24/7."""
+        # Warmup singkat 15 detik setelah start jika wfm_storage_state.json sudah ada di volume
+        await asyncio.sleep(15)
+        await self.keep_alive()
+        while True:
+            await asyncio.sleep(max(120, interval_seconds))
+            await self.keep_alive()
