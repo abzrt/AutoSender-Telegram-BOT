@@ -177,6 +177,16 @@ DIVISION_LABELS: dict[str, str] = {
     "maintenance": "🔧 Maintenance",
 }
 
+ADING_TECH_CHANNELS: dict[str, str] = {
+    "ARIFIN": "-1002202217652",
+    "MUHAMMAD RISQI": "-1002165761538",
+    "AHMAD SYAHRIZAK RAMADHANI": "-1002280689139",
+    "ANJELLO": "-1002960116555",
+    "ANDI MUHAMMAD RAJAB": "-1003818907805",
+    "MUHAMMAD NAZAR ALFATH": "-1004329000380",
+    "ALIF JUNAIDI": "-1002975699950",
+}
+
 
 def build_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Keyboard menu awal bot dengan 3 divisi utama + menu Setting."""
@@ -246,6 +256,7 @@ def build_ading_menu_keyboard() -> InlineKeyboardMarkup:
                 )
             ],
             [InlineKeyboardButton("🌐 Buka Web ADING (ading.web.id)", url="https://ading.web.id/")],
+            [InlineKeyboardButton("👷 Mapping Teknisi (Channel + Pribadi)", callback_data="ading:techmap")],
             [
                 InlineKeyboardButton("🧪 Test Kirim ADING", callback_data="ading:test"),
                 InlineKeyboardButton("🆔 Cek Chat / Topic ID", callback_data="menu:chatid"),
@@ -4168,6 +4179,48 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🆔 Chat ID: <code>{chat_id}</code>{thread_line}\n"
             "🤖 Bot: <code>@biarndalupa_bot</code>\n\n"
             "Gunakan tombol di bawah untuk download APK terbaru atau test koneksi:",
+            parse_mode="HTML",
+            reply_markup=build_ading_menu_keyboard(),
+        )
+        return
+
+    if data == "ading:techmap":
+        known_groups: dict[str, dict[str, str]] = context.bot_data.get("known_groups", {})
+        known_members: dict[str, dict[str, dict[str, str]]] = context.bot_data.get("known_members", {})
+        personal_candidates: list[tuple[str, str]] = []
+        for cid_str, info in known_groups.items():
+            if info.get("type") in ("user", "private") or (cid_str.isdigit()):
+                personal_candidates.append((str(info.get("title") or "").upper(), cid_str))
+        for _scope, mems in known_members.items():
+            for mkey, minfo in mems.items():
+                lbl = str(minfo.get("label") or "").upper()
+                tok = str(minfo.get("token") or "")
+                m_uid = re.search(r"tg://user\?id=(\d+)", tok)
+                uid_val = m_uid.group(1) if m_uid else (mkey if str(mkey).isdigit() else "")
+                if uid_val:
+                    personal_candidates.append((lbl, uid_val))
+
+        mapping_lines: list[str] = []
+        for tech_name, ch_id in ADING_TECH_CHANNELS.items():
+            found_uid = ""
+            t_tokens = [w for w in tech_name.upper().split() if len(w) >= 3]
+            for cand_label, cand_uid in personal_candidates:
+                if tech_name.upper() in cand_label or (t_tokens and all(tok in cand_label for tok in t_tokens[:2])):
+                    found_uid = cand_uid
+                    break
+            if found_uid:
+                mapping_lines.append(f"{tech_name}={ch_id},{found_uid}")
+            else:
+                mapping_lines.append(f"{tech_name}={ch_id}")
+
+        block = "\n".join(mapping_lines)
+        await query.edit_message_text(
+            "<b>👷 Mapping Channel &amp; ID Pribadi Teknisi (ADING)</b>\n\n"
+            "Salin blok di bawah ke menu <b>Pengaturan WFM → Mapping Teknisi</b> di ADING Mobile "
+            "(format: <code>NAMA=CHANNEL_ID,ID_PRIBADI</code>):\n\n"
+            f"<pre>{html.escape(block)}</pre>\n\n"
+            "<i>Tips: pastikan <code>@biarndalupa_bot</code> sudah jadi Admin di semua channel teknisi "
+            "dan masing-masing teknisi sudah klik /start di bot agar pesan pribadi bisa terkirim.</i>",
             parse_mode="HTML",
             reply_markup=build_ading_menu_keyboard(),
         )
