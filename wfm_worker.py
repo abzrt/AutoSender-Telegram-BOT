@@ -289,47 +289,56 @@ class WfmFlowWorker:
             if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur or "about:blank" in cur:
                 await self._perform_login_and_otp(page, notify_otp_cb)
 
-            # Sekarang sudah pasti di halaman terautentikasi (/home). Gunakan #searchWonum dulu seperti user asli.
-            opened_via_search = False
-            try:
-                search_inp = page.locator("#searchWonum").first
-                if await search_inp.count() > 0:
-                    await search_inp.click()
-                    await search_inp.fill(clean_wo)
-                    await search_inp.press("Enter")
-                    for _ in range(16):
-                        await asyncio.sleep(0.5)
-                        if "/editworkorder" in page.url.lower():
-                            opened_via_search = True
-                            break
-                        if "/unauthorize" in page.url.lower():
-                            break
-                    logger.info("[WFM] After #searchWonum(%s) -> %s (ok=%s)", clean_wo, page.url, opened_via_search)
-            except Exception as srch_exc:
-                logger.warning("[WFM] #searchWonum error: %s", srch_exc)
-
-            # Jika belum masuk ke /EditWorkorder/<WO>, navigasi dengan Referer dari /home
-            if not opened_via_search and "/editworkorder" not in page.url.lower():
+            # Sekarang sudah pasti di halaman terautentikasi. Kembalikan navbar jika sebelumnya disembunyikan saat SS.
+            target_wo_path = f"/editworkorder/{clean_wo.lower()}"
+            if target_wo_path not in page.url.lower():
                 try:
-                    await page.goto(
-                        target_url,
-                        wait_until="domcontentloaded",
-                        referer=f"{FLOW_BASE_URL}/home",
-                        timeout=30000,
+                    await page.evaluate(
+                        "() => document.querySelectorAll('nav, header, .navbar').forEach(n => n.style.display = '')"
                     )
-                except Exception as nav_exc:
-                    if "ERR_ABORTED" in str(nav_exc):
-                        await asyncio.sleep(1.5)
+                except Exception:
+                    pass
+
+                opened_via_search = False
+                try:
+                    search_inp = page.locator("#searchWonum").first
+                    if await search_inp.count() > 0:
+                        await search_inp.click(timeout=5000)
+                        await search_inp.fill(clean_wo)
+                        await search_inp.press("Enter")
+                        for _ in range(16):
+                            await asyncio.sleep(0.5)
+                            if target_wo_path in page.url.lower():
+                                opened_via_search = True
+                                break
+                            if "/unauthorize" in page.url.lower():
+                                break
+                        logger.info("[WFM] After #searchWonum(%s) -> %s (ok=%s)", clean_wo, page.url, opened_via_search)
+                except Exception as srch_exc:
+                    logger.warning("[WFM] #searchWonum error: %s", srch_exc)
+
+                # Jika belum masuk ke /EditWorkorder/<WO_BARU>, navigasi dengan Referer dari halaman saat ini / /home
+                if not opened_via_search and target_wo_path not in page.url.lower():
+                    try:
                         await page.goto(
                             target_url,
                             wait_until="domcontentloaded",
                             referer=f"{FLOW_BASE_URL}/home",
                             timeout=30000,
                         )
-                    else:
-                        raise
-                await asyncio.sleep(0.8)
-                logger.info("[WFM] Referer goto %s -> %s", target_url, page.url)
+                    except Exception as nav_exc:
+                        if "ERR_ABORTED" in str(nav_exc):
+                            await asyncio.sleep(1.5)
+                            await page.goto(
+                                target_url,
+                                wait_until="domcontentloaded",
+                                referer=f"{FLOW_BASE_URL}/home",
+                                timeout=30000,
+                            )
+                        else:
+                            raise
+                    await asyncio.sleep(0.8)
+                    logger.info("[WFM] Referer goto %s -> %s", target_url, page.url)
 
             # Tunggu kartu Workorder selesai render
             card_ready = False
