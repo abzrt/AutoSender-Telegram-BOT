@@ -556,3 +556,12 @@ def test_format_dispatch_caption_and_markup() -> None:
     copy_btns = [b for b in buttons if b.copy_text is not None]
     assert len(copy_btns) == 1
     assert len(copy_btns[0].copy_text.text) <= 250
+
+
+def test_extract_otp_from_hcm_message() -> None:
+    from wfm_worker import extract_otp_from_message_text
+
+    assert extract_otp_from_message_text("Kode OTP login FLOW Anda: 482910. Berlaku 3 menit.") == "482910"
+    assert extract_otp_from_message_text("NIK 16830482 meminta OTP: 903112") == "903112"
+    assert extract_otp_from_message_text("Token akses: 123456") == "123456"
+    assert extract_otp_from_message_text("Pesan tanpa kode") == ""

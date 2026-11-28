@@ -24,6 +24,16 @@ FLOW_BASE_URL = "https://flow.telkomakses.co.id"
 FLOW_EDIT_WO_URL = f"{FLOW_BASE_URL}/EditWorkorder/"
 
 
+def extract_otp_from_message_text(text: str) -> str:
+    """Ekstrak 6 digit kode OTP dari teks pesan @HCMTelkomAksesBot."""
+    raw = text or ""
+    near = re.search(r"(?:otp|kode|code|token|pin)[^\d]{0,30}(?<!\d)(\d{6})(?!\d)", raw, re.IGNORECASE)
+    if near:
+        return near.group(1)
+    any6 = re.search(r"(?<!\d)(\d{6})(?!\d)", raw)
+    return any6.group(1) if any6 else ""
+
+
 def unmask_caption_with_flow_data(raw_caption: str, card_info: dict[str, Any]) -> str:
     """Ganti field bersensor bintang (*) pada teks Salin ADING dengan data asli dari WFM FLOW."""
     if not raw_caption:
@@ -162,12 +172,62 @@ class WfmFlowWorker:
             except Exception as exc:
                 logger.warning("Gagal menyimpan wfm_storage_state.json: %s", exc)
 
+    async def _fetch_otp_via_telethon(self, since_utc: datetime, timeout_seconds: int = 30) -> str:
+        """Baca OTP 6 digit otomatis dari @HCMTelkomAksesBot memakai Telethon StringSession."""
+        api_id_raw = os.getenv("TG_API_ID", "").strip()
+        api_hash = os.getenv("TG_API_HASH", "").strip()
+        session_str = os.getenv("TG_STRING_SESSION", "").strip()
+        otp_bot = os.getenv("TG_OTP_BOT_USERNAME", "HCMTelkomAksesBot").strip().lstrip("@")
+        if not (api_id_raw and api_hash and session_str):
+            return ""
+        try:
+            api_id = int(api_id_raw)
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+        except Exception as exc:
+            logger.warning("[WFM] Telethon tidak siap: %s", exc)
+            return ""
+
+        client = TelegramClient(StringSession(session_str), api_id, api_hash)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.warning("[WFM] TG_STRING_SESSION tidak valid / belum authorized.")
+                return ""
+            deadline = asyncio.get_running_loop().time() + max(5, timeout_seconds)
+            while asyncio.get_running_loop().time() < deadline:
+                msgs = await client.get_messages(otp_bot, limit=5)
+                for msg in msgs:
+                    msg_dt = getattr(msg, "date", None)
+                    if msg_dt is None:
+                        continue
+                    if msg_dt.tzinfo is None:
+                        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                    else:
+                        msg_dt = msg_dt.astimezone(timezone.utc)
+                    if msg_dt < since_utc:
+                        continue
+                    code = extract_otp_from_message_text(getattr(msg, "message", "") or "")
+                    if code:
+                        logger.info("[WFM] Auto-OTP tertangkap otomatis dari @%s!", otp_bot)
+                        return code
+                await asyncio.sleep(1.5)
+        except Exception as exc:
+            logger.warning("[WFM] Gagal auto-fetch OTP via Telethon: %s", exc)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        return ""
+
     async def _perform_login_and_otp(
         self,
         page: Any,
         notify_otp_cb: Callable[[str], Awaitable[None]] | None,
     ) -> None:
-        """Lakukan login FLOW dan tunggu kode OTP dari Telegram Admin jika diperlukan."""
+        """Lakukan login FLOW dan tunggu kode OTP (auto via Telethon @HCMTelkomAksesBot atau fallback manual)."""
+        otp_requested_utc = datetime.now(timezone.utc) - timedelta(seconds=10)
         await page.goto(f"{FLOW_BASE_URL}/", wait_until="domcontentloaded", timeout=30000)
         await asyncio.sleep(0.8)
 
@@ -191,6 +251,7 @@ class WfmFlowWorker:
                 }"""
             )
             submit_btn = page.locator("#loginForm button[type='submit'], button.btn-danger[type='submit']").first
+            otp_requested_utc = datetime.now(timezone.utc) - timedelta(seconds=5)
             await submit_btn.click()
 
             # Tunggu sampai pindah ke /otp atau muncul error password salah
@@ -211,24 +272,26 @@ class WfmFlowWorker:
                 if "password salah" in err_txt.lower():
                     raise RuntimeError(f"Password FLOW salah untuk akun {self.flow_user}! Update env FLOW_PASS.")
 
-        # Jika sekarang di /otp, minta kode OTP dari Admin via Telegram
+        # Jika sekarang di /otp, coba auto-baca dari @HCMTelkomAksesBot via Telethon dulu; jika gagal fallback manual
         if "/otp" in page.url.lower() or await page.locator("#otp, input[name='otp']").count() > 0:
-            loop = asyncio.get_running_loop()
-            self._otp_future = loop.create_future()
-            self.waiting_for_otp = True
-            try:
-                if notify_otp_cb:
-                    await notify_otp_cb(
-                        "🔐 <b>WFM FLOW Membutuhkan Kode OTP!</b>\n\n"
-                        "Kode OTP telah dikirim oleh FLOW ke Telegram Anda.\n"
-                        "Balas pesan ini dengan perintah:\n"
-                        "<code>/otp 123456</code>\n\n"
-                        "<i>(Batas waktu 3 menit. Setelah berhasil, sesi akan tersimpan otomatis di server.)</i>"
-                    )
-                otp_code = await asyncio.wait_for(self._otp_future, timeout=180)
-            finally:
-                self.waiting_for_otp = False
-                self._otp_future = None
+            otp_code = await self._fetch_otp_via_telethon(otp_requested_utc, timeout_seconds=30)
+            if not otp_code:
+                loop = asyncio.get_running_loop()
+                self._otp_future = loop.create_future()
+                self.waiting_for_otp = True
+                try:
+                    if notify_otp_cb:
+                        await notify_otp_cb(
+                            "🔐 <b>WFM FLOW Membutuhkan Kode OTP!</b>\n\n"
+                            "Kode OTP telah dikirim oleh FLOW ke Telegram Anda.\n"
+                            "Balas pesan ini dengan perintah:\n"
+                            "<code>/otp 123456</code>\n\n"
+                            "<i>(Batas waktu 3 menit. Setelah berhasil, sesi akan tersimpan otomatis di server.)</i>"
+                        )
+                    otp_code = await asyncio.wait_for(self._otp_future, timeout=180)
+                finally:
+                    self.waiting_for_otp = False
+                    self._otp_future = None
 
             otp_inp = page.locator("#otp, input[name='otp']").first
             await otp_inp.click()
