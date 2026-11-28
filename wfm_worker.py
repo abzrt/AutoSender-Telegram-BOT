@@ -377,30 +377,8 @@ class WfmFlowWorker:
         except Exception:
             pass
 
-        # 2. Cari URL daftar Workorder dari localStorage.menus (antisipasi case-sensitive seperti /Workorder)
+        # 2. Buka halaman /workorder dan isi filter #scorderno secara langsung
         wo_list_url = f"{FLOW_BASE_URL}/workorder"
-        try:
-            menu_info = await page.evaluate(
-                """() => {
-                    const raw = localStorage.getItem('menus') || '';
-                    const matches = raw.match(/\/[a-zA-Z0-9_/-]*workorder[a-zA-Z0-9_/-]*/gi) || [];
-                    const links = Array.from(document.querySelectorAll('a[href]'))
-                        .map(a => a.getAttribute('href') || '')
-                        .filter(h => /workorder/i.test(h) && !/editworkorder/i.test(h));
-                    const scripts = Array.from(document.querySelectorAll('script[src]'))
-                        .map(s => s.getAttribute('src') || '')
-                        .filter(s => /search|global|workorder/i.test(s));
-                    return {matches: matches.slice(0, 10), links: links.slice(0, 10), scripts: scripts.slice(0, 10)};
-                }"""
-            )
-            logger.info("[WFM] Menu discovery: %s", menu_info)
-            cands = [u for u in (menu_info.get("links") or []) + (menu_info.get("matches") or []) if "edit" not in u.lower()]
-            if cands:
-                u0 = cands[0]
-                wo_list_url = u0 if u0.startswith("http") else f"{FLOW_BASE_URL}{u0 if u0.startswith('/') else '/' + u0}"
-        except Exception as exc:
-            logger.warning("[WFM] Menu discovery err: %s", exc)
-
         await page.goto(
             wo_list_url,
             wait_until="domcontentloaded",
@@ -411,129 +389,83 @@ class WfmFlowWorker:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
             pass
-        await asyncio.sleep(1.0)
-        logger.info("[WFM] Opened WO list URL=%s -> actual=%s", wo_list_url, page.url)
+        await asyncio.sleep(0.8)
 
-        # Buka panel/modal filter SEKALI saja (jangan toggle buka-tutup), lalu isi Track ID / SC Order No
-        for step in range(3):
-            state = await page.evaluate(
-                """({targetSc, allowOpen}) => {
-                    function isVisible(el) {
-                        if (!el) return false;
-                        const st = window.getComputedStyle(el);
-                        const r = el.getBoundingClientRect();
-                        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 10 && r.height > 10;
-                    }
-                    function findScInput() {
-                        const selectors = [
-                            'input[id*="scorder" i]', 'input[name*="scorder" i]',
-                            'input[id*="sc_order" i]', 'input[name*="sc_order" i]',
-                            'input[placeholder*="SC Order" i]', 'input[placeholder*="Track" i]',
-                            'input[id*="track" i]', 'input[name*="track" i]',
-                            'input[id*="crm" i]', 'input[name*="crm" i]',
-                            'input[placeholder*="CRM" i]', 'input[placeholder*="Order" i]'
-                        ];
-                        for (const sel of selectors) {
-                            for (const el of document.querySelectorAll(sel)) {
-                                if (!el.readOnly && !el.disabled && isVisible(el)) return el;
-                            }
-                        }
-                        for (const lb of document.querySelectorAll('label, div, span, th')) {
-                            if (lb.children.length > 1) continue;
-                            const t = (lb.innerText || '').trim().toLowerCase();
-                            if (t.includes('track id') || t.includes('sc order') || t.includes('crm no') || t === 'sc' || t === 'no sc') {
-                                const c = lb.parentElement;
-                                const f = c ? c.querySelector('input:not([readonly]):not([disabled])') : null;
-                                if (f && isVisible(f)) return f;
-                                const ns = lb.nextElementSibling;
-                                const f2 = ns ? (ns.matches('input') ? ns : ns.querySelector('input:not([readonly]):not([disabled])')) : null;
-                                if (f2 && isVisible(f2)) return f2;
-                            }
-                        }
-                        return null;
-                    }
+        # Klik tombol Filter (exact text 'Filter') lewat Playwright agar modal terbuka sempurna
+        try:
+            filter_btn = page.locator("button:text-is('Filter'), a:text-is('Filter'), button:has-text('Filter')").first
+            if await filter_btn.count() > 0:
+                await filter_btn.click(timeout=4000)
+                await asyncio.sleep(0.6)
+        except Exception as f_exc:
+            logger.warning("[WFM] Klik tombol Filter gagal: %s", f_exc)
 
-                    let scInp = findScInput();
-                    if (!scInp && allowOpen) {
-                        for (const btn of document.querySelectorAll('[data-bs-toggle="modal"], [data-toggle="modal"], [data-bs-toggle="offcanvas"], button, a')) {
-                            const bt = (btn.innerText || btn.title || '').toLowerCase();
-                            if (bt.includes('filter') || btn.querySelector('.bi-funnel, .fa-filter')) {
-                                btn.click();
-                                return {status: 'OPENED_FILTER'};
-                            }
-                        }
+        # Isi #scorderno, bersihkan filter tanggal/default, lalu klik Apply / Submit di form filter
+        apply_res = await page.evaluate(
+            r"""(targetSc) => {
+                const scInp = document.getElementById('scorderno') || document.querySelector('input[name="scorderno"]');
+                if (!scInp) return {status: 'NO_SCORDERNO'};
+                const scope = scInp.closest('.modal, form') || document;
+                const btns = Array.from(scope.querySelectorAll('button, a, input[type="button"], input[type="submit"], input[type="reset"]'));
+                for (const b of btns) {
+                    const bt = (b.innerText || b.value || '').trim().toLowerCase();
+                    if (bt === 'clear all' || bt === 'reset' || bt === 'clear') {
+                        b.click();
+                        break;
                     }
-                    scInp = findScInput();
-                    if (scInp) {
-                        const scope = scInp.closest('.modal, .offcanvas, form, .card') || document;
-                        const btns = scope.querySelectorAll('button, a, input[type="button"], input[type="reset"], input[type="submit"]');
-                        for (const b of btns) {
-                            if ((b.innerText || b.value || '').trim().toLowerCase() === 'clear all') {
-                                b.click();
-                                break;
-                            }
-                        }
-                        scInp.focus();
-                        scInp.value = targetSc;
-                        scInp.dispatchEvent(new Event('input', {bubbles: true}));
-                        scInp.dispatchEvent(new Event('change', {bubbles: true}));
-                        for (const b of btns) {
-                            const bt = (b.innerText || b.value || '').trim().toLowerCase();
-                            if (bt === 'apply' || bt === 'apply filters' || bt === 'search' || bt === 'cari' || bt === 'filter') {
-                                b.click();
-                                return {status: 'APPLIED_FILTER', id: scInp.id, name: scInp.name};
-                            }
-                        }
-                        scInp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
-                        return {status: 'ENTERED_FILTER', id: scInp.id, name: scInp.name};
+                }
+                const fromD = document.getElementById('from_date');
+                const toD = document.getElementById('to_date');
+                if (fromD) { fromD.value = ''; fromD.dispatchEvent(new Event('change', {bubbles: true})); }
+                if (toD) { toD.value = ''; toD.dispatchEvent(new Event('change', {bubbles: true})); }
+
+                scInp.focus();
+                scInp.value = targetSc;
+                scInp.dispatchEvent(new Event('input', {bubbles: true}));
+                scInp.dispatchEvent(new Event('change', {bubbles: true}));
+
+                const btnLabels = btns.map(b => (b.innerText || b.value || '').trim()).filter(Boolean);
+                for (const b of btns) {
+                    const bt = (b.innerText || b.value || '').trim().toLowerCase();
+                    if (bt === 'apply' || bt === 'apply filters' || bt === 'submit' || bt === 'search' || bt === 'cari') {
+                        b.click();
+                        return {status: 'CLICKED_' + bt.toUpperCase(), btnLabels};
                     }
-                    const dtSearch = document.querySelector('.dataTables_filter input, input[type="search"]');
-                    if (dtSearch && isVisible(dtSearch)) {
-                        dtSearch.focus();
-                        dtSearch.value = targetSc;
-                        dtSearch.dispatchEvent(new Event('input', {bubbles: true}));
-                        dtSearch.dispatchEvent(new Event('change', {bubbles: true}));
-                        return {status: 'APPLIED_DT_SEARCH'};
-                    }
-                    const dbg = Array.from(document.querySelectorAll('input, select')).slice(0, 25)
-                        .map(i => `${i.tagName}:${i.id}|${i.name}|${i.placeholder || ''}|vis=${isVisible(i)}`);
-                    const btnsDbg = Array.from(document.querySelectorAll('button, a')).filter(isVisible)
-                        .map(b => (b.innerText || b.title || '').trim())
-                        .filter(t => t && t.length < 30).slice(0, 20);
-                    return {status: 'NO_INPUT', inputs: dbg, btns: btnsDbg};
-                }""",
-                {"targetSc": q_clean, "allowOpen": step == 0},
-            )
-            logger.info("[WFM] /workorder filter step %d -> %s", step, state)
-            st = state.get("status") if isinstance(state, dict) else str(state)
-            if st in ("APPLIED_FILTER", "ENTERED_FILTER", "APPLIED_DT_SEARCH"):
-                break
-            await asyncio.sleep(1.0)
+                }
+                const form = scInp.closest('form');
+                if (form) {
+                    form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+                    return {status: 'SUBMITTED_FORM', btnLabels};
+                }
+                return {status: 'FILLED_ONLY', btnLabels};
+            }""",
+            q_clean,
+        )
+        logger.info("[WFM] /workorder #scorderno(%s) -> %s", q_clean, apply_res)
 
         # Tunggu baris hasil tabel muncul dan ekstrak WONUM
         for _ in range(24):
             await asyncio.sleep(0.5)
             found_wo = await page.evaluate(
-                """(targetLower) => {
+                r"""(targetLower) => {
                     const rows = document.querySelectorAll('table tbody tr');
                     let fallbackWo = '';
                     for (const r of rows) {
                         const txt = (r.innerText || '');
-                        if (/no data|no matching|tidak ada/i.test(txt)) continue;
-                        const m = txt.match(/\\bWO\\d{6,}\\b/i);
-                        if (!m) {
-                            const link = r.querySelector('a[href*="EditWorkorder" i]');
-                            if (link) {
-                                const lm = (link.getAttribute('href') || '').match(/WO\\d{6,}/i);
-                                if (lm) {
-                                    if (txt.toLowerCase().includes(targetLower)) return lm[0].toUpperCase();
-                                    if (!fallbackWo) fallbackWo = lm[0].toUpperCase();
-                                }
-                            }
-                            continue;
+                        if (/no data|no matching|tidak ada|loading/i.test(txt)) continue;
+                        const m = txt.match(/\bWO\d{6,}\b/i);
+                        if (m) {
+                            if (txt.toLowerCase().includes(targetLower)) return m[0].toUpperCase();
+                            if (!fallbackWo) fallbackWo = m[0].toUpperCase();
                         }
-                        if (txt.toLowerCase().includes(targetLower)) return m[0].toUpperCase();
-                        if (!fallbackWo) fallbackWo = m[0].toUpperCase();
+                        const link = r.querySelector('a[href*="EditWorkorder" i]');
+                        if (link) {
+                            const lm = (link.getAttribute('href') || '').match(/WO\d{6,}/i);
+                            if (lm) {
+                                if (txt.toLowerCase().includes(targetLower)) return lm[0].toUpperCase();
+                                if (!fallbackWo) fallbackWo = lm[0].toUpperCase();
+                            }
+                        }
                     }
                     return rows.length === 1 ? fallbackWo : '';
                 }""",
