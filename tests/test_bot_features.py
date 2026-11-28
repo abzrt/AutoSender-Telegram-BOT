@@ -529,3 +529,30 @@ async def test_wo_anti_spam_deletes_previous_message(tmp_path) -> None:
     )
     assert deleted2 == 1
     fake_bot.delete_message.assert_awaited_once_with(chat_id=-1002202217652, message_id=101)
+
+
+def test_format_dispatch_caption_and_markup() -> None:
+    from bot import format_dispatch_caption_and_markup
+
+    raw = (
+        "NO SC: AOi4261127031815846ae45c0\n"
+        "WONUM: WO069308951\n"
+        "NO INTERNET: 161502308344\n"
+        "CUSTOMER NAME: Yordan Yusak\n"
+        "CONTACT NUMBER: 081228103431\n"
+        "ALAMAT: Jl. Sei Fatimah Nunukan\n"
+        "ODP: ODP-NNK-FL/012\n"
+        "KORDINAT: 4.111723, 117.62325"
+    )
+    html_cap, markup = format_dispatch_caption_and_markup(raw)
+    assert "<code>WO069308951</code>" in html_cap
+    assert "+6281228103431" in html_cap
+    assert 'href="https://wa.me/6281228103431"' in html_cap
+    assert 'href="https://maps.google.com/?q=4.111723,117.62325"' in html_cap
+    assert markup is not None
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    assert any(b.url == "https://wa.me/6281228103431" for b in buttons)
+    assert any(b.url == "https://maps.google.com/?q=4.111723,117.62325" for b in buttons)
+    copy_btns = [b for b in buttons if b.copy_text is not None]
+    assert len(copy_btns) == 1
+    assert len(copy_btns[0].copy_text.text) <= 250

@@ -30,7 +30,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from telegram import Bot, BotCommand, ChatMember, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, BotCommand, ChatMember, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest, ChatMigrated, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -4902,11 +4902,18 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                     sent_to: list[str] = []
                     matched_titles: list[str] = []
                     sent_records: list[dict[str, int]] = []
+                    html_caption, reply_markup = format_dispatch_caption_and_markup(final_caption)
                     for cid_str, title in matched:
                         try:
                             bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
-                            sent_msg = await application.bot.send_photo(chat_id=int(cid_str), photo=bio, caption=final_caption)
+                            sent_msg = await application.bot.send_photo(
+                                chat_id=int(cid_str),
+                                photo=bio,
+                                caption=html_caption,
+                                parse_mode="HTML",
+                                reply_markup=reply_markup,
+                            )
                             sent_to.append(cid_str)
                             matched_titles.append(title)
                             sent_records.append({"chat_id": int(cid_str), "message_id": sent_msg.message_id})
@@ -4920,11 +4927,18 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                             f"⚠️ Channel teknisi ({tech_label}) belum ditemukan / bot belum Admin.\n"
                             f"Masukkan @biarndalupa_bot sebagai Admin di channel teknisi (judul memuat Nama/NIK).\n\n"
                             f"{final_caption}"
-                        )[:1020]
+                        )[:950]
+                        fb_html, fb_markup = format_dispatch_caption_and_markup(fb_cap)
                         try:
                             bio = io.BytesIO(png_bytes_local)
                             bio.name = "workorder.png"
-                            sent_msg = await application.bot.send_photo(chat_id=int(fallback_cid), photo=bio, caption=fb_cap)
+                            sent_msg = await application.bot.send_photo(
+                                chat_id=int(fallback_cid),
+                                photo=bio,
+                                caption=fb_html,
+                                parse_mode="HTML",
+                                reply_markup=fb_markup,
+                            )
                             sent_to.append(fallback_cid)
                             matched_titles.append("Fallback Chat")
                             sent_records.append({"chat_id": int(fallback_cid), "message_id": sent_msg.message_id})
@@ -4978,6 +4992,88 @@ def extract_wo_key(wonum: str, caption: str = "") -> str:
         return clean
     m = re.search(r"\bWO\d{6,}\b", (caption or "").upper())
     return m.group(0) if m else ""
+
+
+def format_dispatch_caption_and_markup(plain_caption: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Format caption dispatch WO agar 1-tap copy (<code>), No HP link Telpon+WA, dan Koordinat link Maps."""
+    if not plain_caption:
+        return "", None
+
+    copy_labels = {"NO SC", "WONUM", "NO INTERNET", "CUSTOMER NAME", "ALAMAT", "ODP"}
+    wa_digits = ""
+    maps_coord = ""
+    summary_parts: list[str] = []
+    html_lines: list[str] = []
+
+    for raw_line in plain_caption.splitlines():
+        if ":" not in raw_line:
+            html_lines.append(html.escape(raw_line))
+            continue
+
+        label, val_raw = raw_line.split(":", 1)
+        label_clean = label.strip()
+        label_upper = label_clean.upper()
+        val = val_raw.strip()
+
+        if not val or val == "-":
+            html_lines.append(f"{html.escape(label_clean)}: {html.escape(val)}")
+            continue
+
+        if label_upper == "CONTACT NUMBER":
+            digits = re.sub(r"\D+", "", val)
+            if digits.startswith("0"):
+                digits = "62" + digits[1:]
+            elif digits.startswith("8"):
+                digits = "62" + digits
+            if len(digits) >= 9:
+                wa_digits = digits
+                summary_parts.append(f"HP: +{digits}")
+                html_lines.append(
+                    f'{html.escape(label_clean)}: +{digits} (<a href="https://wa.me/{digits}">💬 WA</a>)'
+                )
+            else:
+                html_lines.append(f"{html.escape(label_clean)}: <code>{html.escape(val)}</code>")
+            continue
+
+        if label_upper in ("KORDINAT", "KOORDINAT"):
+            coord_match = re.search(r"(-?\d{1,3}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)", val)
+            if coord_match:
+                lat, lng = coord_match.group(1), coord_match.group(2)
+                maps_coord = f"{lat},{lng}"
+                summary_parts.append(f"LOC: {lat},{lng}")
+                html_lines.append(
+                    f'{html.escape(label_clean)}: <code>{html.escape(val)}</code> '
+                    f'(<a href="https://maps.google.com/?q={lat},{lng}">📍 Maps</a>)'
+                )
+            else:
+                html_lines.append(f"{html.escape(label_clean)}: <code>{html.escape(val)}</code>")
+            continue
+
+        if label_upper in copy_labels:
+            if label_upper in ("WONUM", "NO SC", "NO INTERNET", "CUSTOMER NAME", "ODP"):
+                short_val = val[:40]
+                summary_parts.append(f"{label_upper}: {short_val}")
+            html_lines.append(f"{html.escape(label_clean)}: <code>{html.escape(val)}</code>")
+            continue
+
+        html_lines.append(f"{html.escape(label_clean)}: {html.escape(val)}")
+
+    html_caption = "\n".join(html_lines)
+    rows: list[list[InlineKeyboardButton]] = []
+    action_row: list[InlineKeyboardButton] = []
+    if wa_digits:
+        action_row.append(InlineKeyboardButton("💬 Chat WA", url=f"https://wa.me/{wa_digits}"))
+    if maps_coord:
+        action_row.append(InlineKeyboardButton("📍 Buka Maps", url=f"https://maps.google.com/?q={maps_coord}"))
+    if action_row:
+        rows.append(action_row)
+
+    copy_text = "\n".join(summary_parts).strip()
+    if copy_text:
+        rows.append([InlineKeyboardButton("📋 Copy Ringkas", copy_text=CopyTextButton(text=copy_text[:250]))])
+
+    markup = InlineKeyboardMarkup(rows) if rows else None
+    return html_caption, markup
 
 
 async def replace_previous_wo_messages(
@@ -5084,6 +5180,7 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             card = await worker.capture_workorder(wonum, _notify_otp)
             caption = build_flow_summary_caption(wonum, card)
+            html_caption, reply_markup = format_dispatch_caption_and_markup(caption)
             bio = io.BytesIO(card["png_bytes"])
             bio.name = f"{wonum}.png"
 
@@ -5096,7 +5193,13 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     for cid_str, title in matched:
                         b2 = io.BytesIO(card["png_bytes"])
                         b2.name = f"{wonum}.png"
-                        sent_msg = await context.bot.send_photo(chat_id=int(cid_str), photo=b2, caption=caption)
+                        sent_msg = await context.bot.send_photo(
+                            chat_id=int(cid_str),
+                            photo=b2,
+                            caption=html_caption,
+                            parse_mode="HTML",
+                            reply_markup=reply_markup,
+                        )
                         sent_titles.append(title)
                         sent_records.append({"chat_id": int(cid_str), "message_id": sent_msg.message_id})
                     await replace_previous_wo_messages(
@@ -5111,7 +5214,13 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     )
                     return
 
-            sent_msg = await context.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            sent_msg = await context.bot.send_photo(
+                chat_id=chat_id,
+                photo=bio,
+                caption=html_caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
             await replace_previous_wo_messages(
                 context.bot,
                 config.schedules_file.parent,
