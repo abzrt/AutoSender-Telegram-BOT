@@ -718,6 +718,8 @@ class WfmFlowWorker:
             self._disconnect_notified = False
             self.last_keepalive_at = self._now_wita().strftime("%H:%M WITA")
             self._record_dispatch()
+            if not str(card_info.get("wo") or "").strip():
+                card_info["wo"] = clean_wo
             card_info["png_bytes"] = png_bytes
             return card_info
 

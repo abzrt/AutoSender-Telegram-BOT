@@ -5107,12 +5107,12 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
 
 
 def extract_wo_key(wonum: str, caption: str = "") -> str:
-    """Ambil kunci WONUM unik (contoh: WO069272106) untuk anti-spam auto-delete kiriman lama."""
+    """Ambil kunci WONUM unik (contoh: WO069272106) agar anti-spam konsisten baik lewat WO, AO, maupun SC."""
     clean = (wonum or "").strip().upper()
-    if clean:
+    if re.fullmatch(r"WO\d{5,}", clean):
         return clean
-    m = re.search(r"\bWO\d{6,}\b", (caption or "").upper())
-    return m.group(0) if m else ""
+    m = re.search(r"\bWO\d{5,}\b", f"{clean} {(caption or '').upper()}")
+    return m.group(0) if m else clean
 
 
 def format_dispatch_caption_and_markup(plain_caption: str) -> tuple[str, InlineKeyboardMarkup | None]:
@@ -5523,8 +5523,8 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async def _run_wo_task() -> None:
         try:
             card = await worker.capture_workorder(wonum, _notify_otp)
-            resolved_wo = str(card.get("wo") or wonum).strip().upper()
-            caption = build_flow_summary_caption(resolved_wo, card)
+            caption = build_flow_summary_caption(str(card.get("wo") or wonum), card)
+            resolved_wo = extract_wo_key(str(card.get("wo") or wonum), caption)
             html_caption, reply_markup = format_dispatch_caption_and_markup(caption)
             bio = io.BytesIO(card["png_bytes"])
             bio.name = f"{resolved_wo}.png"

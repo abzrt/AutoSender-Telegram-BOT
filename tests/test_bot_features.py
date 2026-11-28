@@ -508,6 +508,7 @@ async def test_wo_anti_spam_deletes_previous_message(tmp_path) -> None:
 
     assert extract_wo_key("wo069272106") == "WO069272106"
     assert extract_wo_key("", "NO SC: 123\nWONUM: WO069325687\nALAMAT: Test") == "WO069325687"
+    assert extract_wo_key("AOi4261128103031812876ff0", "NO SC: AOi4261128103031812876ff0\nWONUM: WO069339598") == "WO069339598"
 
     fake_bot = AsyncMock()
     # Kiriman pertama: tidak ada yang dihapus
