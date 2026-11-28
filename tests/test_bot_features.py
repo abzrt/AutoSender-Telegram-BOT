@@ -565,3 +565,26 @@ def test_extract_otp_from_hcm_message() -> None:
     assert extract_otp_from_message_text("NIK 16830482 meminta OTP: 903112") == "903112"
     assert extract_otp_from_message_text("Token akses: 123456") == "123456"
     assert extract_otp_from_message_text("Pesan tanpa kode") == ""
+
+
+def test_psb_daily_list_auto_record_and_redispatch(tmp_path) -> None:
+    from datetime import timezone, timedelta
+    from bot import format_psb_daily_list, record_psb_daily_dispatch, resolve_psb_tech_label
+
+    wita = timezone(timedelta(hours=8))
+    assert resolve_psb_tech_label(["ARIFIN - 16985859"], "", "") == "ARIFIN"
+    assert resolve_psb_tech_label(["AHMAD SYAHRIZAL RAMADHANI - 16013401"], "", "") == "DHANI"
+    assert resolve_psb_tech_label(["ANJELLO"], "", "") == "ANJELO"
+
+    record_psb_daily_dispatch(tmp_path, wita, "ARIFIN", "WO069308951", "NANI SATRIANI", date_key="2026-11-17")
+    txt1 = format_psb_daily_list(tmp_path, wita, date_key="2026-11-17")
+    assert txt1.startswith("LIST PSB NNK SNY 17/11/2026\n\nARIFIN\n1. NANI SATRIANI\n2. ")
+    assert "\n\nRISQI\n1. \n2. " in txt1
+    assert "\n\nDHANI\n1. \n2. " in txt1
+    assert "\n\nALIF\n1. \n2. " in txt1
+
+    # Re-dispatch WONUM yang sama ke DHANI: otomatis pindah dari ARIFIN ke DHANI tanpa duplikat
+    record_psb_daily_dispatch(tmp_path, wita, "DHANI", "WO069308951", "NANI SATRIANI", date_key="2026-11-17")
+    txt2 = format_psb_daily_list(tmp_path, wita, date_key="2026-11-17")
+    assert "ARIFIN\n1. \n2. " in txt2
+    assert "DHANI\n1. NANI SATRIANI\n2. " in txt2

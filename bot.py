@@ -242,6 +242,7 @@ def build_provisioning_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📱 ADING Mobile & Web (Auto-Dispatch)", callback_data="menu:ading")],
+            [InlineKeyboardButton("📋 List PSB Hari Ini", callback_data="prov:psblist")],
             [
                 InlineKeyboardButton("🖥️ Status WFM & Channel", callback_data="prov:wfmstatus"),
                 InlineKeyboardButton("📡 Tes 7 Channel", callback_data="prov:testchannels"),
@@ -4185,6 +4186,61 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if data == "prov:psblist":
+        psb_text = format_psb_daily_list(config.schedules_file.parent, config.tzinfo)
+        await query.edit_message_text(
+            f"<pre>{html.escape(psb_text)}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
+                        InlineKeyboardButton("📤 Kirim ke Chat", callback_data="prov:psblist:send"),
+                    ],
+                    [InlineKeyboardButton("🗑️ Reset List Hari Ini", callback_data="prov:psblist:reset")],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
+        )
+        return
+
+    if data == "prov:psblist:send":
+        chat = update.effective_chat
+        if chat:
+            psb_text = format_psb_daily_list(config.schedules_file.parent, config.tzinfo)
+            sent_psb = await context.bot.send_message(chat_id=chat.id, text=psb_text)
+            await replace_previous_wo_messages(
+                context.bot,
+                config.schedules_file.parent,
+                f"PSB_LIST:{chat.id}",
+                [{"chat_id": chat.id, "message_id": sent_psb.message_id}],
+            )
+        return
+
+    if data == "prov:psblist:reset":
+        reset_psb_daily_list(config.schedules_file.parent, config.tzinfo)
+        psb_text = format_psb_daily_list(config.schedules_file.parent, config.tzinfo)
+        await query.edit_message_text(
+            f"✅ <i>List PSB hari ini direset.</i>\n\n<pre>{html.escape(psb_text)}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
+                        InlineKeyboardButton("📤 Kirim ke Chat", callback_data="prov:psblist:send"),
+                    ],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
+        )
+        return
+
     if data == "prov:wfmstatus":
         worker: WfmFlowWorker | None = context.bot_data.get("wfm_worker")
         st = worker.get_status() if worker else {"session_active": False, "waiting_for_otp": False, "last_keepalive_at": "-", "dispatches_today": 0}
@@ -4955,6 +5011,16 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                             wo_key,
                             sent_records,
                         )
+                    if sent_to and not used_fallback:
+                        tech_lbl = resolve_psb_tech_label(matched_titles, leader_name, nama_tim, sent_to)
+                        cust_nm = extract_customer_name_from_caption(final_caption)
+                        record_psb_daily_dispatch(
+                            application.bot_data["config"].schedules_file.parent,
+                            application.bot_data["config"].tzinfo,
+                            tech_lbl,
+                            wo_key or wonum,
+                            cust_nm,
+                        )
 
                     return {
                         "ok": len(sent_to) > 0,
@@ -5127,6 +5193,163 @@ async def replace_previous_wo_messages(
     return deleted
 
 
+# ==================== LIST PSB HARIAN OTOMATIS ====================
+
+PSB_LIST_TECH_ORDER: list[str] = ["ARIFIN", "RISQI", "ANJELO", "DHANI", "RAJAB", "NAZAR", "ALIF"]
+
+PSB_TECH_ALIAS_MAP: list[tuple[str, tuple[str, ...]]] = [
+    ("ARIFIN", ("-1002202217652", "ARIFIN")),
+    ("RISQI", ("-1005839757356", "RISQI")),
+    ("ANJELO", ("-1002960116555", "ANJELLO", "ANJELO")),
+    ("DHANI", ("-1002280689139", "RAMADHANI", "SYAHRIZAL", "DHANI")),
+    ("RAJAB", ("-1003818907805", "RAJAB")),
+    ("NAZAR", ("-1004329000380", "NAZAR", "ALFATH")),
+    ("ALIF", ("-1002975699950", "ALIF", "JUNAIDI")),
+]
+
+
+def resolve_psb_tech_label(
+    matched_titles: list[str],
+    leader_name: str = "",
+    nama_tim: str = "",
+    sent_to: list[str] | None = None,
+) -> str:
+    """Petakan nama/channel teknisi ke label pendek LIST PSB (ARIFIN, RISQI, ANJELO, DHANI, RAJAB, NAZAR, ALIF)."""
+    hay = " ".join([*(sent_to or []), *(matched_titles or []), leader_name or "", nama_tim or ""]).upper()
+    for label, keywords in PSB_TECH_ALIAS_MAP:
+        if any(k in hay for k in keywords):
+            return label
+    raw = (leader_name or (matched_titles[0] if matched_titles else "") or nama_tim or "LAINNYA").strip().upper()
+    raw = re.sub(r"\s*[-–]\s*\d{5,}.*$", "", raw).strip()
+    return raw or "LAINNYA"
+
+
+def extract_customer_name_from_caption(caption: str) -> str:
+    """Ambil nama pelanggan dari baris CUSTOMER NAME: pada caption dispatch."""
+    for line in (caption or "").splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            if k.strip().upper() == "CUSTOMER NAME":
+                val = v.strip()
+                if val and val != "-":
+                    return val.upper()
+    return ""
+
+
+def _load_psb_daily_store(state_dir: Path) -> dict[str, dict[str, list[dict[str, str]]]]:
+    path = state_dir / "psb_daily_list.json"
+    if not path.exists():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_psb_daily_store(state_dir: Path, data: dict[str, dict[str, list[dict[str, str]]]]) -> None:
+    path = state_dir / "psb_daily_list.json"
+    if len(data) > 30:
+        for old_k in sorted(data.keys())[:-30]:
+            data.pop(old_k, None)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Gagal menyimpan psb_daily_list.json: %s", exc)
+
+
+def record_psb_daily_dispatch(
+    state_dir: Path,
+    tz: Any,
+    tech_label: str,
+    wonum: str,
+    customer_name: str,
+    date_key: str | None = None,
+) -> None:
+    """Catat dispatch WO ke list PSB harian per teknisi (anti-duplikat & pindah otomatis jika re-dispatch)."""
+    if not tech_label:
+        return
+    now_dt = datetime.now(tz)
+    dkey = date_key or now_dt.strftime("%Y-%m-%d")
+    wo_clean = (wonum or "").strip().upper()
+    cust_clean = (customer_name or wo_clean or "-").strip().upper()
+
+    store = _load_psb_daily_store(state_dir)
+    day_bucket = store.setdefault(dkey, {})
+
+    # Hapus entri lama dengan WONUM yang sama di teknisi mana pun (anti-duplikat / pindah teknisi saat re-dispatch)
+    if wo_clean:
+        for t_key, entries in list(day_bucket.items()):
+            day_bucket[t_key] = [e for e in entries if str(e.get("wonum") or "").upper() != wo_clean]
+
+    tech_entries = day_bucket.setdefault(tech_label, [])
+    if not wo_clean and any(str(e.get("customer") or "").upper() == cust_clean for e in tech_entries):
+        return
+    tech_entries.append({"wonum": wo_clean, "customer": cust_clean})
+    _save_psb_daily_store(state_dir, store)
+
+
+def reset_psb_daily_list(state_dir: Path, tz: Any, date_key: str | None = None) -> None:
+    """Kosongkan list PSB hari ini."""
+    dkey = date_key or datetime.now(tz).strftime("%Y-%m-%d")
+    store = _load_psb_daily_store(state_dir)
+    store[dkey] = {}
+    _save_psb_daily_store(state_dir, store)
+
+
+def format_psb_daily_list(state_dir: Path, tz: Any, date_key: str | None = None) -> str:
+    """Format teks LIST PSB NNK SNY DD/MM/YYYY sesuai template Provisioning."""
+    now_dt = datetime.now(tz)
+    dkey = date_key or now_dt.strftime("%Y-%m-%d")
+    try:
+        dt_disp = datetime.strptime(dkey, "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        dt_disp = now_dt.strftime("%d/%m/%Y")
+
+    store = _load_psb_daily_store(state_dir)
+    day_bucket = store.get(dkey, {})
+
+    ordered_techs = list(PSB_LIST_TECH_ORDER)
+    for extra in day_bucket.keys():
+        if extra not in ordered_techs and day_bucket.get(extra):
+            ordered_techs.append(extra)
+
+    blocks: list[str] = [f"LIST PSB NNK SNY {dt_disp}"]
+    for tech in ordered_techs:
+        entries = day_bucket.get(tech, [])
+        slots = max(2, len(entries))
+        lines = [tech]
+        for idx in range(slots):
+            val = str(entries[idx].get("customer") or "").strip() if idx < len(entries) else ""
+            lines.append(f"{idx + 1}. {val}" if val else f"{idx + 1}. ")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+async def cmd_listpsb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tampilkan & kirim LIST PSB NNK SNY hari ini."""
+    if not update.message or not update.effective_chat:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    psb_text = format_psb_daily_list(config.schedules_file.parent, config.tzinfo)
+    await update.message.reply_html(
+        f"<pre>{html.escape(psb_text)}</pre>",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
+                    InlineKeyboardButton("📤 Kirim Teks Polos", callback_data="prov:psblist:send"),
+                ],
+                [InlineKeyboardButton("🗑️ Reset List Hari Ini", callback_data="prov:psblist:reset")],
+            ]
+        ),
+    )
+
+
 # ==================== LIFECYCLE & CLI ====================
 
 
@@ -5207,6 +5430,15 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         config.schedules_file.parent,
                         wonum,
                         sent_records,
+                    )
+                    tech_lbl = resolve_psb_tech_label(sent_titles, tech_query, tech_query, [c for c, _ in matched])
+                    cust_nm = extract_customer_name_from_caption(caption)
+                    record_psb_daily_dispatch(
+                        config.schedules_file.parent,
+                        config.tzinfo,
+                        tech_lbl,
+                        wonum,
+                        cust_nm,
                     )
                     await status_msg.edit_text(
                         f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
@@ -5528,6 +5760,7 @@ def main() -> None:
     application.add_handler(CommandHandler("reload", cmd_reload))
     application.add_handler(CommandHandler("otp", cmd_otp))
     application.add_handler(CommandHandler("wo", cmd_wo))
+    application.add_handler(CommandHandler("listpsb", cmd_listpsb))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
 
     logger.info("Menjalankan Telegram AutoSender Bot...")
