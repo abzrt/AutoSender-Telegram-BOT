@@ -839,6 +839,18 @@ async def track_group_activity(update: Update, context: ContextTypes.DEFAULT_TYP
 
     remember_group(context.bot_data, chat.id, chat.title or f"Grup {chat.id}", chat.type)
 
+    # Auto-catat ke List PSB harian jika ada kiriman order (termasuk manual/forward) di channel teknisi
+    if chat.type == "channel" and msg and str(chat.id) in ADING_TECH_CHANNELS.values():
+        post_txt = (msg.caption or msg.text or "").strip()
+        if post_txt:
+            cust_nm = extract_customer_name_from_caption(post_txt)
+            wo_key = extract_wo_key("", post_txt)
+            if cust_nm or wo_key:
+                cfg: BotConfig | None = context.bot_data.get("config")
+                if cfg is not None:
+                    tech_lbl = resolve_psb_tech_label([chat.title or ""], chat.title or "", "", [str(chat.id)])
+                    record_psb_daily_dispatch(cfg.schedules_file.parent, cfg.tzinfo, tech_lbl, wo_key, cust_nm)
+
     # Pasif perbarui @username jika pengirim sudah tersimpan di Kelola Target (tanpa menambah user baru)
     user = update.effective_user
     if user and not getattr(user, "is_bot", False) and getattr(user, "username", None):
@@ -5587,6 +5599,19 @@ async def post_init(application: Application) -> None:
     asyncio.create_task(
         application.bot_data["wfm_worker"].start_keep_alive_loop(600, on_disconnect_cb=_on_wfm_disconnect)
     )
+
+    async def _psb_auto_sync_loop() -> None:
+        await asyncio.sleep(25)
+        while True:
+            try:
+                cnt, _ = await sync_psb_list_from_channels(config.schedules_file.parent, config.tzinfo)
+                if cnt > 0:
+                    logger.info("[PSB] Auto-sync dari 7 channel selesai (%d order terbaca).", cnt)
+            except Exception as exc:
+                logger.debug("[PSB] Auto-sync skipped: %s", exc)
+            await asyncio.sleep(600)
+
+    asyncio.create_task(_psb_auto_sync_loop())
     start_ading_http_bridge(application, asyncio.get_running_loop())
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
