@@ -4464,13 +4464,19 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
-    if data in ("assur:closing", "assur:closing:detail", "assur:closing:send"):
-        is_detail = data == "assur:closing:detail"
+    if data in ("assur:closing", "assur:closing:detail", "assur:closing:refresh", "assur:closing:detail:refresh", "assur:closing:send"):
+        is_detail = "detail" in data
+        force_live = "refresh" in data
         if data == "assur:closing:send":
             chat = update.effective_chat
             if chat:
-                await query.answer("⏳ Mengambil data closing dari 3 grup Area...", show_alert=False)
-                rep = await fetch_assurance_closing_report(config.tzinfo, detail=True)
+                await query.answer("⏳ Mengirim List Closing terbaru...", show_alert=False)
+                rep = await fetch_assurance_closing_report(
+                    config.tzinfo,
+                    detail=True,
+                    state_dir=config.schedules_file.parent,
+                    force_refresh=True,
+                )
                 msg_txt = rep["text"]
                 if len(msg_txt) > 4000:
                     msg_txt = rep["summary_text"]
@@ -4483,14 +4489,21 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 )
             return
 
-        await query.edit_message_text(
-            "⏳ <b>Mengambil List Closing Tiket dari 3 grup Assurance (Area 1, 2, 3)...</b>",
-            parse_mode="HTML",
+        if force_live:
+            await query.edit_message_text(
+                "⏳ <b>Menyinkronkan List Closing Tiket dari 3 grup Assurance (Area 1, 2, 3)...</b>",
+                parse_mode="HTML",
+            )
+        rep = await fetch_assurance_closing_report(
+            config.tzinfo,
+            detail=is_detail,
+            state_dir=config.schedules_file.parent,
+            force_refresh=force_live,
         )
-        rep = await fetch_assurance_closing_report(config.tzinfo, detail=is_detail)
         disp = rep["text"]
         if len(disp) > 3950:
             disp = disp[:3900] + "\n... (terpotong, gunakan tampilan Ringkasan)"
+        refresh_cb = "assur:closing:detail:refresh" if is_detail else "assur:closing:refresh"
         toggle_btn = (
             InlineKeyboardButton("📊 Ringkasan", callback_data="assur:closing")
             if is_detail
@@ -4502,7 +4515,7 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=InlineKeyboardMarkup(
                 [
                     [
-                        InlineKeyboardButton("🔄 Refresh", callback_data=data),
+                        InlineKeyboardButton("🔄 Refresh", callback_data=refresh_cb),
                         toggle_btn,
                     ],
                     [InlineKeyboardButton("📤 Kirim ke Chat Ini", callback_data="assur:closing:send")],
@@ -5652,12 +5665,63 @@ def _match_assurance_area(title: str) -> str:
     return ""
 
 
-async def fetch_assurance_closing_report(tz: Any, detail: bool = False) -> dict[str, Any]:
+def _load_assurance_closing_cache(state_dir: Path | None, dkey: str) -> dict[str, Any] | None:
+    if state_dir is None:
+        return None
+    path = state_dir / "assurance_closing_cache.json"
+    if not path.exists():
+        return None
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and loaded.get("date_key") == dkey:
+            return loaded
+    except Exception:
+        pass
+    return None
+
+
+def _save_assurance_closing_cache(state_dir: Path | None, dkey: str, rep: dict[str, Any]) -> None:
+    if state_dir is None:
+        return
+    path = state_dir / "assurance_closing_cache.json"
+    payload = {
+        "date_key": dkey,
+        "summary_text": rep.get("summary_text", ""),
+        "detail_text": rep.get("detail_text", ""),
+        "total_closed": int(rep.get("total_closed", 0)),
+        "areas_found": list(rep.get("areas_found", [])),
+        "fingerprint": rep.get("fingerprint", ""),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Gagal menyimpan assurance_closing_cache.json: %s", exc)
+
+
+async def fetch_assurance_closing_report(
+    tz: Any,
+    detail: bool = False,
+    state_dir: Path | None = None,
+    force_refresh: bool = True,
+) -> dict[str, Any]:
     """Ambil pesan CLOSED HARI INI dari 3 grup Assurance (Area 1, 2, 3) via Telethon & susun ringkasannya."""
     now_dt = datetime.now(tz)
     dkey = now_dt.strftime("%Y-%m-%d")
     dt_disp = now_dt.strftime("%d/%m/%Y")
     time_disp = now_dt.strftime("%H:%M WITA")
+
+    if not force_refresh:
+        cached = _load_assurance_closing_cache(state_dir, dkey)
+        if cached:
+            return {
+                "text": cached["detail_text"] if detail else cached["summary_text"],
+                "summary_text": cached["summary_text"],
+                "detail_text": cached["detail_text"],
+                "total_closed": cached["total_closed"],
+                "areas_found": cached["areas_found"],
+                "fingerprint": cached.get("fingerprint", ""),
+            }
 
     api_id_raw = os.getenv("TG_API_ID", "").strip()
     api_hash = os.getenv("TG_API_HASH", "").strip()
@@ -5795,13 +5859,17 @@ async def fetch_assurance_closing_report(tz: Any, detail: bool = False) -> dict[
     detail_blocks.append(gt_block)
     summary_text = "\n\n".join(summary_blocks)
     detail_text = "\n\n".join(detail_blocks)
-    return {
+    fp = "|".join(sorted(seen_global_inc)) + f":{total_in}:{total_out}"
+    result = {
         "text": detail_text if detail else summary_text,
         "summary_text": summary_text,
         "detail_text": detail_text,
         "total_closed": grand_total,
         "areas_found": area_found,
+        "fingerprint": fp,
     }
+    _save_assurance_closing_cache(state_dir, dkey, result)
+    return result
 
 
 async def cmd_listclosing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5812,15 +5880,18 @@ async def cmd_listclosing(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin(update, config, context.bot_data):
         await deny_access(update)
         return
-    wait_msg = await update.message.reply_html("⏳ Mengambil List Closing Tiket dari 3 grup Assurance...")
-    rep = await fetch_assurance_closing_report(config.tzinfo, detail=False)
-    await wait_msg.edit_text(
+    rep = await fetch_assurance_closing_report(
+        config.tzinfo,
+        detail=False,
+        state_dir=config.schedules_file.parent,
+        force_refresh=False,
+    )
+    await update.message.reply_html(
         f"<pre>{html.escape(rep['summary_text'])}</pre>",
-        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton("🔄 Refresh", callback_data="assur:closing"),
+                    InlineKeyboardButton("🔄 Refresh", callback_data="assur:closing:refresh"),
                     InlineKeyboardButton("📄 Rincian INC", callback_data="assur:closing:detail"),
                 ],
                 [InlineKeyboardButton("📤 Kirim ke Chat Ini", callback_data="assur:closing:send")],
@@ -5980,6 +6051,31 @@ async def post_init(application: Application) -> None:
             await asyncio.sleep(600)
 
     asyncio.create_task(_psb_auto_sync_loop())
+
+    async def _assur_auto_sync_loop() -> None:
+        await asyncio.sleep(40)
+        last_fp = ""
+        while True:
+            try:
+                rep = await fetch_assurance_closing_report(
+                    config.tzinfo,
+                    detail=False,
+                    state_dir=config.schedules_file.parent,
+                    force_refresh=True,
+                )
+                new_fp = str(rep.get("fingerprint") or "")
+                if new_fp != last_fp:
+                    last_fp = new_fp
+                    logger.info(
+                        "[ASSUR] Auto-sync tersimpan (total_closed=%d, areas=%s).",
+                        rep.get("total_closed", 0),
+                        rep.get("areas_found", []),
+                    )
+            except Exception as exc:
+                logger.debug("[ASSUR] Auto-sync skipped: %s", exc)
+            await asyncio.sleep(300)
+
+    asyncio.create_task(_assur_auto_sync_loop())
     start_ading_http_bridge(application, asyncio.get_running_loop())
     ensure_schedules_file(config.schedules_file)
     jobs = load_schedules(config.schedules_file)
