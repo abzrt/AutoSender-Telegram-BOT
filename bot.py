@@ -5487,7 +5487,7 @@ async def cmd_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Standalone ambil SS HD Workorder langsung dari WFM FLOW: /wo WO069272106 [opsional: nama/NIK teknisi]."""
+    """Standalone ambil SS HD Workorder langsung dari WFM FLOW: /wo <WONUM/No AO/No SC> [opsional: nama/NIK teknisi]."""
     if not update.message or not update.effective_chat:
         return
     config: BotConfig = context.bot_data["config"]
@@ -5498,12 +5498,14 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_html(
             "<b>🖥️ WFM FLOW Standalone</b>\n\n"
-            "Gunakan:\n"
-            "• <code>/wo WO069272106</code> — ambil SS HD &amp; kirim ke chat ini\n"
-            "• <code>/wo WO069272106 ARIFIN</code> — ambil SS HD &amp; kirim otomatis ke channel teknisi"
+            "Gunakan (bisa <b>WONUM</b>, <b>No AO</b>, atau <b>No SC</b>):\n"
+            "• <code>/wo WO069272106</code>\n"
+            "• <code>/wo AOi4261128103031812876ff0</code>\n"
+            "• <code>/wo WO069272106 ARIFIN</code> — kirim otomatis ke channel teknisi"
         )
         return
-    wonum = args[0].strip().upper()
+    raw_query = args[0].strip()
+    wonum = raw_query.upper() if re.fullmatch(r"WO\d{5,}", raw_query, re.IGNORECASE) else raw_query
     tech_query = " ".join(args[1:]).strip()
     worker: WfmFlowWorker = context.bot_data["wfm_worker"]
     chat_id = update.effective_chat.id
@@ -5516,10 +5518,11 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     async def _run_wo_task() -> None:
         try:
             card = await worker.capture_workorder(wonum, _notify_otp)
-            caption = build_flow_summary_caption(wonum, card)
+            resolved_wo = str(card.get("wo") or wonum).strip().upper()
+            caption = build_flow_summary_caption(resolved_wo, card)
             html_caption, reply_markup = format_dispatch_caption_and_markup(caption)
             bio = io.BytesIO(card["png_bytes"])
-            bio.name = f"{wonum}.png"
+            bio.name = f"{resolved_wo}.png"
 
             if tech_query:
                 known_groups = context.bot_data.get("known_groups", {})
@@ -5529,7 +5532,7 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     sent_records: list[dict[str, int]] = []
                     for cid_str, title in matched:
                         b2 = io.BytesIO(card["png_bytes"])
-                        b2.name = f"{wonum}.png"
+                        b2.name = f"{resolved_wo}.png"
                         sent_msg = await context.bot.send_photo(
                             chat_id=int(cid_str),
                             photo=b2,
@@ -5542,7 +5545,7 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     await replace_previous_wo_messages(
                         context.bot,
                         config.schedules_file.parent,
-                        wonum,
+                        resolved_wo,
                         sent_records,
                     )
                     tech_lbl = resolve_psb_tech_label(sent_titles, tech_query, tech_query, [c for c, _ in matched])
@@ -5551,11 +5554,11 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         config.schedules_file.parent,
                         config.tzinfo,
                         tech_lbl,
-                        wonum,
+                        resolved_wo,
                         cust_nm,
                     )
                     await status_msg.edit_text(
-                        f"✅ SS HD <b>{html.escape(wonum)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
+                        f"✅ SS HD <b>{html.escape(resolved_wo)}</b> berhasil dikirim ke channel: <b>{html.escape(', '.join(sent_titles))}</b>!",
                         parse_mode="HTML",
                     )
                     return
@@ -5570,7 +5573,7 @@ async def cmd_wo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await replace_previous_wo_messages(
                 context.bot,
                 config.schedules_file.parent,
-                wonum,
+                resolved_wo,
                 [{"chat_id": chat_id, "message_id": sent_msg.message_id}],
             )
             await status_msg.delete()
@@ -5886,7 +5889,7 @@ def main() -> None:
     application.add_handler(CommandHandler("test", cmd_test))
     application.add_handler(CommandHandler("reload", cmd_reload))
     application.add_handler(CommandHandler("otp", cmd_otp))
-    application.add_handler(CommandHandler("wo", cmd_wo))
+    application.add_handler(CommandHandler(["wo", "ao", "sc"], cmd_wo))
     application.add_handler(CommandHandler("listpsb", cmd_listpsb))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
 

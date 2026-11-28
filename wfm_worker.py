@@ -353,19 +353,167 @@ class WfmFlowWorker:
             logger.info("[WFM] Post-OTP ready: url=%s cookies=%d has_menus=%s", page.url, cookies_cnt, has_menus)
             await self._save_state()
 
+    async def _resolve_wonum_from_sc_or_ao(self, page: Any, query: str) -> str:
+        """Cari nomor WONUM dari No AO / No SC melalui global search & filter halaman /workorder FLOW."""
+        q_clean = query.strip()
+        logger.info("[WFM] Mencari WONUM untuk No AO/SC: %s", q_clean)
+
+        # 1. Coba global search API / #searchWonum terlebih dahulu
+        try:
+            api_wo = await page.evaluate(
+                """async (q) => {
+                    try {
+                        const r = await fetch('/search/api/workorder/' + encodeURIComponent(q), {credentials: 'include'});
+                        const t = await r.text();
+                        const m = t.match(/\\bWO\\d{6,}\\b/i);
+                        return m ? m[0].toUpperCase() : '';
+                    } catch (e) { return ''; }
+                }""",
+                q_clean,
+            )
+            if api_wo:
+                logger.info("[WFM] Resolved %s -> %s via /search/api/workorder", q_clean, api_wo)
+                return api_wo
+        except Exception:
+            pass
+
+        # 2. Buka halaman /workorder, pakai Filter (Track ID / SC Order No) & baca baris tabel
+        await page.goto(
+            f"{FLOW_BASE_URL}/workorder",
+            wait_until="domcontentloaded",
+            referer=f"{FLOW_BASE_URL}/home",
+            timeout=30000,
+        )
+        await asyncio.sleep(1.2)
+
+        # Buka modal filter & terapkan Track ID / SC Order No
+        for step in range(4):
+            state = await page.evaluate(
+                """(targetSc) => {
+                    function findScInput() {
+                        let inp = document.querySelector(
+                            'input[placeholder*="Track" i], input[name*="track" i], input[id*="track" i], ' +
+                            'input[placeholder*="SC Order" i], input[name*="sc_order" i], input[id*="sc_order" i], ' +
+                            'input[name*="crm" i], input[id*="crm" i]'
+                        );
+                        if (inp) return inp;
+                        for (const lb of document.querySelectorAll('label, div, span')) {
+                            if (lb.children.length > 1) continue;
+                            const t = (lb.innerText || '').trim().toLowerCase();
+                            if (t.includes('track id') || t.includes('sc order')) {
+                                const c = lb.parentElement;
+                                const f = c ? c.querySelector('input:not([readonly]):not([disabled])') : null;
+                                if (f) return f;
+                                const ns = lb.nextElementSibling;
+                                const f2 = ns ? (ns.matches('input') ? ns : ns.querySelector('input:not([readonly]):not([disabled])')) : null;
+                                if (f2) return f2;
+                            }
+                        }
+                        return null;
+                    }
+
+                    let scInp = findScInput();
+                    const modalEl = scInp ? scInp.closest('.modal') : null;
+                    const modalHidden = modalEl && !modalEl.classList.contains('show');
+                    if (!scInp || modalHidden) {
+                        for (const btn of document.querySelectorAll('[data-bs-toggle="modal"], [data-toggle="modal"], button, a')) {
+                            const bt = (btn.innerText || btn.title || '').toLowerCase();
+                            if (bt.includes('filter') || btn.querySelector('.bi-funnel, .fa-filter')) {
+                                btn.click();
+                                return 'OPENED_MODAL';
+                            }
+                        }
+                    }
+                    scInp = findScInput();
+                    if (scInp) {
+                        const scope = scInp.closest('.modal') || document;
+                        const btns = scope.querySelectorAll('button, a, input[type="button"], input[type="reset"]');
+                        for (const b of btns) {
+                            if ((b.innerText || b.value || '').trim().toLowerCase() === 'clear all') {
+                                b.click();
+                                break;
+                            }
+                        }
+                        scInp.focus();
+                        scInp.value = targetSc;
+                        scInp.dispatchEvent(new Event('input', {bubbles: true}));
+                        scInp.dispatchEvent(new Event('change', {bubbles: true}));
+                        for (const b of btns) {
+                            const bt = (b.innerText || b.value || '').trim().toLowerCase();
+                            if (bt === 'apply' || bt === 'apply filters' || bt === 'search' || bt === 'cari') {
+                                b.click();
+                                return 'APPLIED_FILTER';
+                            }
+                        }
+                        scInp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
+                        return 'ENTERED_FILTER';
+                    }
+                    const dtSearch = document.querySelector('.dataTables_filter input, input[type="search"]');
+                    if (dtSearch) {
+                        dtSearch.focus();
+                        dtSearch.value = targetSc;
+                        dtSearch.dispatchEvent(new Event('input', {bubbles: true}));
+                        dtSearch.dispatchEvent(new Event('change', {bubbles: true}));
+                        return 'APPLIED_DT_SEARCH';
+                    }
+                    return 'NO_INPUT';
+                }""",
+                q_clean,
+            )
+            logger.info("[WFM] /workorder filter step %d -> %s", step, state)
+            if state in ("APPLIED_FILTER", "ENTERED_FILTER", "APPLIED_DT_SEARCH"):
+                break
+            await asyncio.sleep(0.8)
+
+        # Tunggu baris hasil tabel muncul dan ekstrak WONUM
+        for _ in range(24):
+            await asyncio.sleep(0.5)
+            found_wo = await page.evaluate(
+                """(targetLower) => {
+                    const rows = document.querySelectorAll('table tbody tr');
+                    let fallbackWo = '';
+                    for (const r of rows) {
+                        const txt = (r.innerText || '');
+                        if (/no data|no matching|tidak ada/i.test(txt)) continue;
+                        const m = txt.match(/\\bWO\\d{6,}\\b/i);
+                        if (!m) {
+                            const link = r.querySelector('a[href*="EditWorkorder" i]');
+                            if (link) {
+                                const lm = (link.getAttribute('href') || '').match(/WO\\d{6,}/i);
+                                if (lm) {
+                                    if (txt.toLowerCase().includes(targetLower)) return lm[0].toUpperCase();
+                                    if (!fallbackWo) fallbackWo = lm[0].toUpperCase();
+                                }
+                            }
+                            continue;
+                        }
+                        if (txt.toLowerCase().includes(targetLower)) return m[0].toUpperCase();
+                        if (!fallbackWo) fallbackWo = m[0].toUpperCase();
+                    }
+                    return rows.length === 1 ? fallbackWo : '';
+                }""",
+                q_clean.lower(),
+            )
+            if found_wo:
+                logger.info("[WFM] Resolved %s -> %s via /workorder table", q_clean, found_wo)
+                return found_wo
+
+        raise RuntimeError(f"Order dengan No AO/SC '{q_clean}' tidak ditemukan di tabel /workorder FLOW.")
+
     async def capture_workorder(
         self,
         wonum: str,
         notify_otp_cb: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict[str, Any]:
-        """Buka /EditWorkorder/<wonum>, ekstrak data asli tanpa sensor, & ambil SS HD 2x Retina."""
-        clean_wo = wonum.strip().upper()
-        if not clean_wo:
-            raise ValueError("WONUM tidak boleh kosong.")
+        """Buka /EditWorkorder/<wonum> (mendukung WONUM, No AO, dan No SC), ekstrak data asli, & ambil SS HD 2x."""
+        raw_query = (wonum or "").strip()
+        if not raw_query:
+            raise ValueError("WONUM / No AO / No SC tidak boleh kosong.")
+        is_direct_wo = bool(re.fullmatch(r"WO\d{5,}", raw_query, re.IGNORECASE))
+        clean_wo = raw_query.upper() if is_direct_wo else ""
 
         async with self._lock:
             page = await self._ensure_browser()
-            target_url = f"{FLOW_EDIT_WO_URL}{clean_wo}"
 
             # Buka /home dulu agar sesi & Referer selalu valid (jangan langsung cold-goto /EditWorkorder)
             cur = page.url.lower()
@@ -377,6 +525,12 @@ class WfmFlowWorker:
 
             if "/unauthorize" in cur or cur.rstrip("/") == FLOW_BASE_URL or "/otp" in cur or "/login" in cur or "about:blank" in cur:
                 await self._perform_login_and_otp(page, notify_otp_cb)
+
+            # Jika input berupa No AO / No SC (bukan WO...), cari dulu nomor WONUM aslinya di FLOW
+            if not clean_wo:
+                clean_wo = await self._resolve_wonum_from_sc_or_ao(page, raw_query)
+
+            target_url = f"{FLOW_EDIT_WO_URL}{clean_wo}"
 
             # Sekarang sudah pasti di halaman terautentikasi. Kembalikan navbar jika sebelumnya disembunyikan saat SS.
             target_wo_path = f"/editworkorder/{clean_wo.lower()}"
