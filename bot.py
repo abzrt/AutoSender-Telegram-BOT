@@ -4970,7 +4970,8 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                 nama_tim = str(data.get("nama_tim") or "").strip()
                 caption = str(data.get("caption") or "").strip()
                 photo_b64 = str(data.get("photo_base64") or "").strip()
-                wonum = str(data.get("wonum") or "").strip().upper()
+                raw_wo = str(data.get("wonum") or "").strip()
+                wonum = raw_wo.upper() if re.fullmatch(r"WO\d{5,}", raw_wo, re.IGNORECASE) else raw_wo
                 fallback_cid = str(data.get("fallback_chat_id") or "217411824").strip()
                 is_standalone_wfm = self.path.startswith("/api/wfm/dispatch") or (not photo_b64 and bool(wonum))
 

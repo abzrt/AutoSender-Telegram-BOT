@@ -386,48 +386,59 @@ class WfmFlowWorker:
         )
         await asyncio.sleep(1.2)
 
-        # Buka modal filter & terapkan Track ID / SC Order No
-        for step in range(4):
+        # Buka panel/modal filter SEKALI saja (jangan toggle buka-tutup), lalu isi Track ID / SC Order No
+        for step in range(3):
             state = await page.evaluate(
-                """(targetSc) => {
+                """({targetSc, allowOpen}) => {
+                    function isVisible(el) {
+                        if (!el) return false;
+                        const st = window.getComputedStyle(el);
+                        const r = el.getBoundingClientRect();
+                        return st.display !== 'none' && st.visibility !== 'hidden' && r.width > 10 && r.height > 10;
+                    }
                     function findScInput() {
-                        let inp = document.querySelector(
-                            'input[placeholder*="Track" i], input[name*="track" i], input[id*="track" i], ' +
-                            'input[placeholder*="SC Order" i], input[name*="sc_order" i], input[id*="sc_order" i], ' +
-                            'input[name*="crm" i], input[id*="crm" i]'
-                        );
-                        if (inp) return inp;
-                        for (const lb of document.querySelectorAll('label, div, span')) {
+                        const selectors = [
+                            'input[id*="scorder" i]', 'input[name*="scorder" i]',
+                            'input[id*="sc_order" i]', 'input[name*="sc_order" i]',
+                            'input[placeholder*="SC Order" i]', 'input[placeholder*="Track" i]',
+                            'input[id*="track" i]', 'input[name*="track" i]',
+                            'input[id*="crm" i]', 'input[name*="crm" i]',
+                            'input[placeholder*="CRM" i]', 'input[placeholder*="Order" i]'
+                        ];
+                        for (const sel of selectors) {
+                            for (const el of document.querySelectorAll(sel)) {
+                                if (!el.readOnly && !el.disabled && isVisible(el)) return el;
+                            }
+                        }
+                        for (const lb of document.querySelectorAll('label, div, span, th')) {
                             if (lb.children.length > 1) continue;
                             const t = (lb.innerText || '').trim().toLowerCase();
-                            if (t.includes('track id') || t.includes('sc order')) {
+                            if (t.includes('track id') || t.includes('sc order') || t.includes('crm no') || t === 'sc' || t === 'no sc') {
                                 const c = lb.parentElement;
                                 const f = c ? c.querySelector('input:not([readonly]):not([disabled])') : null;
-                                if (f) return f;
+                                if (f && isVisible(f)) return f;
                                 const ns = lb.nextElementSibling;
                                 const f2 = ns ? (ns.matches('input') ? ns : ns.querySelector('input:not([readonly]):not([disabled])')) : null;
-                                if (f2) return f2;
+                                if (f2 && isVisible(f2)) return f2;
                             }
                         }
                         return null;
                     }
 
                     let scInp = findScInput();
-                    const modalEl = scInp ? scInp.closest('.modal') : null;
-                    const modalHidden = modalEl && !modalEl.classList.contains('show');
-                    if (!scInp || modalHidden) {
-                        for (const btn of document.querySelectorAll('[data-bs-toggle="modal"], [data-toggle="modal"], button, a')) {
+                    if (!scInp && allowOpen) {
+                        for (const btn of document.querySelectorAll('[data-bs-toggle="modal"], [data-toggle="modal"], [data-bs-toggle="offcanvas"], button, a')) {
                             const bt = (btn.innerText || btn.title || '').toLowerCase();
                             if (bt.includes('filter') || btn.querySelector('.bi-funnel, .fa-filter')) {
                                 btn.click();
-                                return 'OPENED_MODAL';
+                                return {status: 'OPENED_FILTER'};
                             }
                         }
                     }
                     scInp = findScInput();
                     if (scInp) {
-                        const scope = scInp.closest('.modal') || document;
-                        const btns = scope.querySelectorAll('button, a, input[type="button"], input[type="reset"]');
+                        const scope = scInp.closest('.modal, .offcanvas, form, .card') || document;
+                        const btns = scope.querySelectorAll('button, a, input[type="button"], input[type="reset"], input[type="submit"]');
                         for (const b of btns) {
                             if ((b.innerText || b.value || '').trim().toLowerCase() === 'clear all') {
                                 b.click();
@@ -440,30 +451,33 @@ class WfmFlowWorker:
                         scInp.dispatchEvent(new Event('change', {bubbles: true}));
                         for (const b of btns) {
                             const bt = (b.innerText || b.value || '').trim().toLowerCase();
-                            if (bt === 'apply' || bt === 'apply filters' || bt === 'search' || bt === 'cari') {
+                            if (bt === 'apply' || bt === 'apply filters' || bt === 'search' || bt === 'cari' || bt === 'filter') {
                                 b.click();
-                                return 'APPLIED_FILTER';
+                                return {status: 'APPLIED_FILTER', id: scInp.id, name: scInp.name};
                             }
                         }
                         scInp.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', keyCode: 13, bubbles: true}));
-                        return 'ENTERED_FILTER';
+                        return {status: 'ENTERED_FILTER', id: scInp.id, name: scInp.name};
                     }
                     const dtSearch = document.querySelector('.dataTables_filter input, input[type="search"]');
-                    if (dtSearch) {
+                    if (dtSearch && isVisible(dtSearch)) {
                         dtSearch.focus();
                         dtSearch.value = targetSc;
                         dtSearch.dispatchEvent(new Event('input', {bubbles: true}));
                         dtSearch.dispatchEvent(new Event('change', {bubbles: true}));
-                        return 'APPLIED_DT_SEARCH';
+                        return {status: 'APPLIED_DT_SEARCH'};
                     }
-                    return 'NO_INPUT';
+                    const dbg = Array.from(document.querySelectorAll('input')).filter(isVisible).slice(0, 15)
+                        .map(i => `${i.id}|${i.name}|${i.placeholder}`);
+                    return {status: 'NO_INPUT', inputs: dbg};
                 }""",
-                q_clean,
+                {"targetSc": q_clean, "allowOpen": step == 0},
             )
             logger.info("[WFM] /workorder filter step %d -> %s", step, state)
-            if state in ("APPLIED_FILTER", "ENTERED_FILTER", "APPLIED_DT_SEARCH"):
+            st = state.get("status") if isinstance(state, dict) else str(state)
+            if st in ("APPLIED_FILTER", "ENTERED_FILTER", "APPLIED_DT_SEARCH"):
                 break
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(1.0)
 
         # Tunggu baris hasil tabel muncul dan ekstrak WONUM
         for _ in range(24):
