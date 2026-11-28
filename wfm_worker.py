@@ -425,9 +425,17 @@ class WfmFlowWorker:
                 scInp.dispatchEvent(new Event('change', {bubbles: true}));
 
                 const btnLabels = btns.map(b => (b.innerText || b.value || '').trim()).filter(Boolean);
+                const applyBtn = btns.find(b => {
+                    const bt = (b.innerText || b.value || '').trim().toLowerCase();
+                    return bt === 'apply' || bt === 'apply filters';
+                });
+                if (applyBtn) {
+                    applyBtn.click();
+                    return {status: 'CLICKED_APPLY', btnLabels};
+                }
                 for (const b of btns) {
                     const bt = (b.innerText || b.value || '').trim().toLowerCase();
-                    if (bt === 'apply' || bt === 'apply filters' || bt === 'submit' || bt === 'search' || bt === 'cari') {
+                    if (bt === 'search' || bt === 'cari') {
                         b.click();
                         return {status: 'CLICKED_' + bt.toUpperCase(), btnLabels};
                     }
