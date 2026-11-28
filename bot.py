@@ -508,35 +508,6 @@ def forget_group(bot_data: dict[str, Any], chat_id: int | str) -> None:
         save_known_groups(config.resolved_groups_file, groups)
 
 
-def remember_member_user(bot_data: dict[str, Any], chat_id: int | str, user: Any) -> None:
-    """Catat satu user Telegram (non-bot) ke daftar anggota grup untuk checklist tag."""
-    if not user or getattr(user, "is_bot", False):
-        return
-    uid = getattr(user, "id", None)
-    if not uid:
-        return
-    username = getattr(user, "username", None)
-    first_name = (getattr(user, "first_name", None) or "").strip()
-    last_name = (getattr(user, "last_name", None) or "").strip()
-    full_name = " ".join(p for p in [first_name, last_name] if p).strip()
-
-    if username:
-        token = f"@{username}"
-        label = f"{full_name} (@{username})" if full_name else f"@{username}"
-    else:
-        clean_name = (full_name or f"User{uid}").replace(":", " ").strip()
-        token = f"{clean_name}:{uid}"
-        label = clean_name
-
-    config: BotConfig = bot_data["config"]
-    members: dict[str, dict[str, dict[str, str]]] = bot_data.setdefault("known_members", {})
-    scope_dict = members.setdefault(str(chat_id), {})
-    entry = {"label": label, "token": token}
-    if scope_dict.get(str(uid)) != entry:
-        scope_dict[str(uid)] = entry
-        save_known_members(config.resolved_members_file, members)
-
-
 def remember_manual_mentions(bot_data: dict[str, Any], mentions: list[str]) -> None:
     """Simpan tag manual yang diketik user ke scope '_saved' agar bisa diklik lagi lain kali."""
     if not mentions:
@@ -3236,16 +3207,6 @@ async def _apply_edited_target(
     elif update.message:
         await update.message.reply_html(msg, reply_markup=keyboard)
     return ConversationHandler.END
-
-
-async def edit_save_target_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if not query or not query.data:
-        return ConversationHandler.END
-    await query.answer()
-
-    chat_id = int(query.data.split(":", 1)[1])
-    return await _apply_edited_target(update, context, [chat_id])
 
 
 async def edit_save_target_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
