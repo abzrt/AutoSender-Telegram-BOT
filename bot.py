@@ -4267,6 +4267,12 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                     text=msg_text,
                     parse_mode="HTML",
                 )
+                await replace_previous_wo_messages(
+                    context.bot,
+                    config.schedules_file.parent,
+                    f"TEST_CONN:{ch_id}",
+                    [{"chat_id": int(ch_id), "message_id": sent_msg.message_id}],
+                )
                 ok_count += 1
                 ch_title = sent_msg.chat.title or tech_name
                 result_lines.append(
