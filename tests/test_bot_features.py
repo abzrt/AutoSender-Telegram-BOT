@@ -535,7 +535,7 @@ def test_format_dispatch_caption_and_markup() -> None:
     from bot import format_dispatch_caption_and_markup
 
     raw = (
-        "NO SC: AOi4261127031815846ae45c0\n"
+        "NO SC: DGPS261128103031345874681-AOi4261128103031812876ff0_116190712-914518116~2026112810410846563836~3~WSA\n"
         "WONUM: WO069308951\n"
         "NO INTERNET: 161502308344\n"
         "CUSTOMER NAME: Yordan Yusak\n"
@@ -545,6 +545,7 @@ def test_format_dispatch_caption_and_markup() -> None:
         "KORDINAT: 4.111723, 117.62325"
     )
     html_cap, markup = format_dispatch_caption_and_markup(raw)
+    assert "NO SC: <code>AOi4261128103031812876ff0</code>" in html_cap
     assert "<code>WO069308951</code>" in html_cap
     assert "+6281228103431" in html_cap
     assert 'href="https://wa.me/6281228103431"' in html_cap

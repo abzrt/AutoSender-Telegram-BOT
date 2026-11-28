@@ -5171,6 +5171,10 @@ def format_dispatch_caption_and_markup(plain_caption: str) -> tuple[str, InlineK
             continue
 
         if label_upper in copy_labels:
+            if label_upper == "NO SC":
+                ao_m = re.search(r"(?<![A-Za-z0-9])(AO[A-Za-z0-9]{6,})", val)
+                if ao_m:
+                    val = ao_m.group(1)
             if label_upper in ("WONUM", "NO SC", "NO INTERNET", "CUSTOMER NAME", "ODP"):
                 short_val = val[:40]
                 summary_parts.append(f"{label_upper}: {short_val}")

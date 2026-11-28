@@ -59,6 +59,15 @@ def unmask_caption_with_flow_data(raw_caption: str, card_info: dict[str, Any]) -
     return "\n".join(out_lines)
 
 
+def normalize_sc_order_no(raw_sc: str) -> str:
+    """Ambil nomor AO bersih (contoh: AOi4261128103031812876ff0) dari string panjang SC Order No FLOW."""
+    val = (raw_sc or "").strip()
+    if not val:
+        return "-"
+    m = re.search(r"(?<![A-Za-z0-9])(AO[A-Za-z0-9]{6,})", val)
+    return m.group(1) if m else val
+
+
 def build_flow_summary_caption(wonum: str, card_info: dict[str, Any]) -> str:
     """Susun caption format standar ADING Mobile jika tidak ada teks Salin ADING (misal dari /wo langsung)."""
     def _v(key: str, default: str = "-") -> str:
@@ -67,7 +76,7 @@ def build_flow_summary_caption(wonum: str, card_info: dict[str, Any]) -> str:
 
     return "\n".join(
         [
-            f"NO SC: {_v('sc')}",
+            f"NO SC: {normalize_sc_order_no(_v('sc', ''))}",
             f"WONUM: {_v('wo', wonum)}",
             f"BOOKING DATE: {_v('booking_date')}",
             f"STO: {_v('sto')}",
