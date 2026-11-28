@@ -5566,9 +5566,18 @@ ASSURANCE_AREA_GROUPS: list[tuple[str, tuple[str, ...]]] = [
 
 
 def parse_assurance_closed_message(text: str) -> dict[str, Any]:
-    """Parse pesan 'CLOSED HARI INI' dari grup Assurance menjadi daftar tiket per kategori & status SLA."""
-    lines = (text or "").splitlines()
-    header = lines[0].strip() if lines else ""
+    """Parse HANYA bagian 'CLOSED HARI INI' dari pesan grup Assurance (abaikan saldo/open di atasnya)."""
+    all_lines = (text or "").splitlines()
+    header = all_lines[0].strip() if all_lines else ""
+
+    # Jika pesan berisi bagian OPEN di atas & bagian CLOSED HARI INI di bawah, potong mulai header CLOSED HARI INI
+    closed_start_idx = 0
+    for idx, ln in enumerate(all_lines):
+        up = ln.strip().upper()
+        if "CLOSED HARI INI" in up and "TOTAL" not in up:
+            closed_start_idx = idx + 1
+    lines = all_lines[closed_start_idx:]
+
     categories: dict[str, list[dict[str, str]]] = {}
     top_cat = ""
     sub_cat = ""
@@ -5583,7 +5592,7 @@ def parse_assurance_closed_message(text: str) -> dict[str, Any]:
         tot_m = re.search(r"TOTAL\s+CLOSED\s+HARI\s+INI\s*[:=]\s*(\d+)", stripped, re.IGNORECASE)
         if tot_m:
             reported_total = int(tot_m.group(1))
-            continue
+            break
 
         if stripped.startswith(("•", "▪", "- ")) and not re.match(r"^\d+\.", stripped):
             lbl = stripped.lstrip("•▪- ").strip()

@@ -596,6 +596,9 @@ def test_parse_assurance_closed_message() -> None:
     from bot import parse_assurance_closed_message
 
     sample = (
+        "LIST WO 🎯 A6NNK2 (OPEN)\n"
+        "• OHI [Non SLA]\n"
+        "  1. INC99999999 | 162500000001 | 28/11 01:00 | -\n\n"
         "LIST WO 🎯 A6NNK2 (CLOSED HARI INI)\n\n"
         "• OHI [Non SLA]\n"
         "  1. INC55411910 | 162505301549 | 28/11 02:42 | 28/11 09:02\n"
