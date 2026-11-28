@@ -4195,9 +4195,38 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 [
                     [
                         InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
-                        InlineKeyboardButton("📤 Kirim ke Chat", callback_data="prov:psblist:send"),
+                        InlineKeyboardButton("📥 Sync Channel", callback_data="prov:psblist:sync"),
                     ],
-                    [InlineKeyboardButton("🗑️ Reset List Hari Ini", callback_data="prov:psblist:reset")],
+                    [
+                        InlineKeyboardButton("📤 Kirim ke Chat", callback_data="prov:psblist:send"),
+                        InlineKeyboardButton("🗑️ Reset Hari Ini", callback_data="prov:psblist:reset"),
+                    ],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
+        )
+        return
+
+    if data == "prov:psblist:sync":
+        await query.edit_message_text("⏳ <b>Menyinkronkan order hari ini dari 7 channel teknisi...</b>", parse_mode="HTML")
+        synced_cnt, psb_text = await sync_psb_list_from_channels(config.schedules_file.parent, config.tzinfo)
+        await query.edit_message_text(
+            f"✅ <i>Sinkronisasi selesai ({synced_cnt} order hari ini terbaca dari channel).</i>\n\n"
+            f"<pre>{html.escape(psb_text)}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
+                        InlineKeyboardButton("📥 Sync Channel", callback_data="prov:psblist:sync"),
+                    ],
+                    [
+                        InlineKeyboardButton("📤 Kirim ke Chat", callback_data="prov:psblist:send"),
+                        InlineKeyboardButton("🗑️ Reset Hari Ini", callback_data="prov:psblist:reset"),
+                    ],
                     [
                         InlineKeyboardButton("⬅️ Kembali ke Provisioning", callback_data="menu:provisioning"),
                         InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
@@ -4898,7 +4927,8 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
             self._send_json(404, {"ok": False, "error": "Not found"})
 
         def do_POST(self) -> None:
-            if not (self.path.startswith("/api/ading/dispatch") or self.path.startswith("/api/wfm/dispatch")):
+            is_psb_sync = self.path.startswith("/api/psb/sync")
+            if not (self.path.startswith("/api/ading/dispatch") or self.path.startswith("/api/wfm/dispatch") or is_psb_sync):
                 self._send_json(404, {"ok": False, "error": "Not found"})
                 return
             if expected_api_key:
@@ -4906,6 +4936,18 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                 if req_key != expected_api_key:
                     self._send_json(401, {"ok": False, "error": "Unauthorized: X-Ading-Key tidak valid"})
                     return
+            if is_psb_sync:
+                try:
+                    cfg = application.bot_data["config"]
+                    fut = asyncio.run_coroutine_threadsafe(
+                        sync_psb_list_from_channels(cfg.schedules_file.parent, cfg.tzinfo),
+                        loop,
+                    )
+                    cnt, psb_text = fut.result(timeout=60)
+                    self._send_json(200, {"ok": True, "synced_count": cnt, "list_text": psb_text})
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
                 raw = self.rfile.read(content_len)
@@ -5327,6 +5369,63 @@ def format_psb_daily_list(state_dir: Path, tz: Any, date_key: str | None = None)
     return "\n\n".join(blocks)
 
 
+async def sync_psb_list_from_channels(
+    state_dir: Path,
+    tz: Any,
+    date_key: str | None = None,
+) -> tuple[int, str]:
+    """Baca ulang pesan order hari ini di 7 channel teknisi via Telethon untuk melengkapi LIST PSB."""
+    now_dt = datetime.now(tz)
+    dkey = date_key or now_dt.strftime("%Y-%m-%d")
+    api_id_raw = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    session_str = os.getenv("TG_STRING_SESSION", "").strip()
+    if not (api_id_raw and api_hash and session_str):
+        return 0, format_psb_daily_list(state_dir, tz, dkey)
+
+    from datetime import timezone as dt_timezone
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    synced = 0
+    client = TelegramClient(StringSession(session_str), int(api_id_raw), api_hash)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            return 0, format_psb_daily_list(state_dir, tz, dkey)
+        for tech_name, ch_id_str in ADING_TECH_CHANNELS.items():
+            tech_lbl = resolve_psb_tech_label([tech_name], tech_name, "", [ch_id_str])
+            try:
+                msgs = await client.get_messages(int(ch_id_str), limit=25)
+            except Exception as exc:
+                logger.warning("Sync PSB gagal baca channel %s (%s): %s", tech_name, ch_id_str, exc)
+                continue
+            for msg in reversed(list(msgs)):
+                msg_dt = getattr(msg, "date", None)
+                txt = getattr(msg, "message", "") or ""
+                if not msg_dt or not txt:
+                    continue
+                if msg_dt.tzinfo is None:
+                    msg_dt = msg_dt.replace(tzinfo=dt_timezone.utc)
+                local_dkey = msg_dt.astimezone(tz).strftime("%Y-%m-%d")
+                if local_dkey != dkey:
+                    continue
+                cust_nm = extract_customer_name_from_caption(txt)
+                wo_key = extract_wo_key("", txt)
+                if not cust_nm and not wo_key:
+                    continue
+                record_psb_daily_dispatch(state_dir, tz, tech_lbl, wo_key, cust_nm, date_key=dkey)
+                synced += 1
+    except Exception as exc:
+        logger.warning("Sync PSB Telethon error: %s", exc)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    return synced, format_psb_daily_list(state_dir, tz, dkey)
+
+
 async def cmd_listpsb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Tampilkan & kirim LIST PSB NNK SNY hari ini."""
     if not update.message or not update.effective_chat:
@@ -5342,9 +5441,12 @@ async def cmd_listpsb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             [
                 [
                     InlineKeyboardButton("🔄 Refresh", callback_data="prov:psblist"),
-                    InlineKeyboardButton("📤 Kirim Teks Polos", callback_data="prov:psblist:send"),
+                    InlineKeyboardButton("📥 Sync Channel", callback_data="prov:psblist:sync"),
                 ],
-                [InlineKeyboardButton("🗑️ Reset List Hari Ini", callback_data="prov:psblist:reset")],
+                [
+                    InlineKeyboardButton("📤 Kirim Teks Polos", callback_data="prov:psblist:send"),
+                    InlineKeyboardButton("🗑️ Reset Hari Ini", callback_data="prov:psblist:reset"),
+                ],
             ]
         ),
     )
