@@ -590,3 +590,33 @@ def test_psb_daily_list_auto_record_and_redispatch(tmp_path) -> None:
     txt2 = format_psb_daily_list(tmp_path, wita, date_key="2026-11-17")
     assert "ARIFIN\n1. \n2. " in txt2
     assert "DHANI\n1. NANI SATRIANI\n2. " in txt2
+
+
+def test_parse_assurance_closed_message() -> None:
+    from bot import parse_assurance_closed_message
+
+    sample = (
+        "LIST WO 🎯 A6NNK2 (CLOSED HARI INI)\n\n"
+        "• OHI [Non SLA]\n"
+        "  1. INC55411910 | 162505301549 | 28/11 02:42 | 28/11 09:02\n"
+        "     ODP-NNK-FJ/033\n"
+        "• SQM [Non SLA]\n"
+        "  1. INC55400267 | 162505211749 | 27/11 20:05 | 28/11 11:21\n"
+        "     ODP-NNK-FAG/046\n"
+        "• PL-TSEL / INDIHOME\n"
+        "  • Gold [12 Jam]\n"
+        "    1. INC55397441 | 162505207255 | 27/11 17:28 | 28/11 10:50 | 👎\n"
+        "       ODP-NNK-FM/059\n"
+        "    2. INC55428957 | 162505210713 | 28/11 08:55 | 28/11 10:00 | 👍\n"
+        "       ODP-NNK-FAF/021\n"
+        "TOTAL CLOSED HARI INI : 4"
+    )
+    parsed = parse_assurance_closed_message(sample)
+    assert parsed["reported_total"] == 4
+    assert len(parsed["tickets"]) == 4
+    assert len(parsed["categories"]["OHI [Non SLA]"]) == 1
+    assert len(parsed["categories"]["SQM [Non SLA]"]) == 1
+    gold = parsed["categories"]["PL-TSEL / INDIHOME — Gold [12 Jam]"]
+    assert len(gold) == 2
+    assert gold[0]["sla"] == "out" and gold[0]["odp"] == "ODP-NNK-FM/059"
+    assert gold[1]["sla"] == "in" and gold[1]["odp"] == "ODP-NNK-FAF/021"

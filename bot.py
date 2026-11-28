@@ -295,6 +295,7 @@ def build_assurance_menu_keyboard() -> InlineKeyboardMarkup:
     """Sub-menu Assurance."""
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton("📊 List Closing Tiket", callback_data="assur:closing")],
             [InlineKeyboardButton("✨ Buat Jadwal Assurance", callback_data="menu:custom")],
             [
                 InlineKeyboardButton("📋 Jadwal Assurance", callback_data="menu:list:assurance"),
@@ -4463,6 +4464,57 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         return
 
+    if data in ("assur:closing", "assur:closing:detail", "assur:closing:send"):
+        is_detail = data == "assur:closing:detail"
+        if data == "assur:closing:send":
+            chat = update.effective_chat
+            if chat:
+                await query.answer("⏳ Mengambil data closing dari 3 grup Area...", show_alert=False)
+                rep = await fetch_assurance_closing_report(config.tzinfo, detail=True)
+                msg_txt = rep["text"]
+                if len(msg_txt) > 4000:
+                    msg_txt = rep["summary_text"]
+                sent_cl = await context.bot.send_message(chat_id=chat.id, text=msg_txt)
+                await replace_previous_wo_messages(
+                    context.bot,
+                    config.schedules_file.parent,
+                    f"ASSUR_CLOSING:{chat.id}",
+                    [{"chat_id": chat.id, "message_id": sent_cl.message_id}],
+                )
+            return
+
+        await query.edit_message_text(
+            "⏳ <b>Mengambil List Closing Tiket dari 3 grup Assurance (Area 1, 2, 3)...</b>",
+            parse_mode="HTML",
+        )
+        rep = await fetch_assurance_closing_report(config.tzinfo, detail=is_detail)
+        disp = rep["text"]
+        if len(disp) > 3950:
+            disp = disp[:3900] + "\n... (terpotong, gunakan tampilan Ringkasan)"
+        toggle_btn = (
+            InlineKeyboardButton("📊 Ringkasan", callback_data="assur:closing")
+            if is_detail
+            else InlineKeyboardButton("📄 Rincian INC", callback_data="assur:closing:detail")
+        )
+        await query.edit_message_text(
+            f"<pre>{html.escape(disp)}</pre>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("🔄 Refresh", callback_data=data),
+                        toggle_btn,
+                    ],
+                    [InlineKeyboardButton("📤 Kirim ke Chat Ini", callback_data="assur:closing:send")],
+                    [
+                        InlineKeyboardButton("⬅️ Kembali ke Assurance", callback_data="menu:assurance"),
+                        InlineKeyboardButton("🏠 Menu Awal", callback_data="menu:home"),
+                    ],
+                ]
+            ),
+        )
+        return
+
     if data == "menu:assurance":
         if context.user_data is not None:
             context.user_data["active_division"] = "assurance"
@@ -4940,7 +4992,13 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
 
         def do_POST(self) -> None:
             is_psb_sync = self.path.startswith("/api/psb/sync")
-            if not (self.path.startswith("/api/ading/dispatch") or self.path.startswith("/api/wfm/dispatch") or is_psb_sync):
+            is_assur_closing = self.path.startswith("/api/assurance/closing")
+            if not (
+                self.path.startswith("/api/ading/dispatch")
+                or self.path.startswith("/api/wfm/dispatch")
+                or is_psb_sync
+                or is_assur_closing
+            ):
                 self._send_json(404, {"ok": False, "error": "Not found"})
                 return
             if expected_api_key:
@@ -4948,6 +5006,35 @@ def start_ading_http_bridge(application: Application, loop: asyncio.AbstractEven
                 if req_key != expected_api_key:
                     self._send_json(401, {"ok": False, "error": "Unauthorized: X-Ading-Key tidak valid"})
                     return
+            if is_assur_closing:
+                try:
+                    content_len = int(self.headers.get("Content-Length", "0"))
+                    raw = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                    detail_mode = bool(body.get("detail", True))
+                    send_cid = str(body.get("send_to_chat_id") or "").strip()
+                    cfg = application.bot_data["config"]
+
+                    async def _run_assur() -> dict[str, Any]:
+                        rep = await fetch_assurance_closing_report(cfg.tzinfo, detail=detail_mode)
+                        if send_cid:
+                            out_txt = rep["text"] if len(rep["text"]) <= 4000 else rep["summary_text"]
+                            sent = await application.bot.send_message(chat_id=int(send_cid), text=out_txt)
+                            await replace_previous_wo_messages(
+                                application.bot,
+                                cfg.schedules_file.parent,
+                                f"ASSUR_CLOSING:{send_cid}",
+                                [{"chat_id": int(send_cid), "message_id": sent.message_id}],
+                            )
+                            rep["sent_message_id"] = sent.message_id
+                        return rep
+
+                    fut = asyncio.run_coroutine_threadsafe(_run_assur(), loop)
+                    res = fut.result(timeout=90)
+                    self._send_json(200, {"ok": True, **res})
+                except Exception as exc:
+                    self._send_json(500, {"ok": False, "error": str(exc)})
+                return
             if is_psb_sync:
                 try:
                     cfg = application.bot_data["config"]
@@ -5469,6 +5556,258 @@ async def cmd_listpsb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# ==================== LIST CLOSING TIKET ASSURANCE ====================
+
+ASSURANCE_AREA_GROUPS: list[tuple[str, tuple[str, ...]]] = [
+    ("NNK01 & NNK05 AREA 1", ("NNK01", "AREA 1")),
+    ("NNK02 & NNK04 AREA 2", ("NNK02", "AREA 2")),
+    ("NNK04 & NNK06 AREA 3", ("NNK06", "AREA 3")),
+]
+
+
+def parse_assurance_closed_message(text: str) -> dict[str, Any]:
+    """Parse pesan 'CLOSED HARI INI' dari grup Assurance menjadi daftar tiket per kategori & status SLA."""
+    lines = (text or "").splitlines()
+    header = lines[0].strip() if lines else ""
+    categories: dict[str, list[dict[str, str]]] = {}
+    top_cat = ""
+    sub_cat = ""
+    last_ticket: dict[str, str] | None = None
+    reported_total: int | None = None
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        tot_m = re.search(r"TOTAL\s+CLOSED\s+HARI\s+INI\s*[:=]\s*(\d+)", stripped, re.IGNORECASE)
+        if tot_m:
+            reported_total = int(tot_m.group(1))
+            continue
+
+        if stripped.startswith(("•", "▪", "- ")) and not re.match(r"^\d+\.", stripped):
+            lbl = stripped.lstrip("•▪- ").strip()
+            indent = len(raw_line) - len(raw_line.lstrip(" "))
+            if indent >= 2 and top_cat:
+                sub_cat = lbl
+            else:
+                top_cat = lbl
+                sub_cat = ""
+            last_ticket = None
+            continue
+
+        inc_m = re.search(r"\b(INC\d+)\b", stripped, re.IGNORECASE)
+        if inc_m:
+            inc = inc_m.group(1).upper()
+            parts = [p.strip() for p in stripped.split("|")]
+            inet = parts[1] if len(parts) > 1 else ""
+            open_t = parts[2] if len(parts) > 2 else ""
+            close_t = parts[3] if len(parts) > 3 else ""
+            sla = "in" if "👍" in stripped else ("out" if "👎" in stripped else "")
+            cat_key = f"{top_cat} — {sub_cat}" if (top_cat and sub_cat) else (top_cat or "LAINNYA")
+            item = {
+                "inc": inc,
+                "inet": inet,
+                "open": open_t,
+                "close": close_t,
+                "sla": sla,
+                "odp": "",
+                "category": cat_key,
+            }
+            categories.setdefault(cat_key, []).append(item)
+            last_ticket = item
+            continue
+
+        if last_ticket is not None:
+            if "👍" in stripped and not last_ticket["sla"]:
+                last_ticket["sla"] = "in"
+            elif "👎" in stripped and not last_ticket["sla"]:
+                last_ticket["sla"] = "out"
+            elif stripped.upper().startswith("ODP-") or "ODP" in stripped.upper():
+                last_ticket["odp"] = stripped
+
+    tickets = [t for lst in categories.values() for t in lst]
+    return {
+        "header": header,
+        "categories": categories,
+        "tickets": tickets,
+        "reported_total": reported_total if reported_total is not None else len(tickets),
+    }
+
+
+def _match_assurance_area(title: str) -> str:
+    upper = (title or "").upper()
+    for area_label, keys in ASSURANCE_AREA_GROUPS:
+        if all(k in upper for k in keys):
+            return area_label
+    return ""
+
+
+async def fetch_assurance_closing_report(tz: Any, detail: bool = False) -> dict[str, Any]:
+    """Ambil pesan CLOSED HARI INI dari 3 grup Assurance (Area 1, 2, 3) via Telethon & susun ringkasannya."""
+    now_dt = datetime.now(tz)
+    dkey = now_dt.strftime("%Y-%m-%d")
+    dt_disp = now_dt.strftime("%d/%m/%Y")
+    time_disp = now_dt.strftime("%H:%M WITA")
+
+    api_id_raw = os.getenv("TG_API_ID", "").strip()
+    api_hash = os.getenv("TG_API_HASH", "").strip()
+    session_str = os.getenv("TG_STRING_SESSION", "").strip()
+    if not (api_id_raw and api_hash and session_str):
+        msg = f"LIST CLOSING TIKET ASSURANCE {dt_disp}\n\n⚠️ Telethon (TG_API_ID/TG_API_HASH/TG_STRING_SESSION) belum aktif."
+        return {"text": msg, "summary_text": msg, "total_closed": 0, "areas_found": []}
+
+    from datetime import timezone as dt_timezone
+    from telethon import TelegramClient
+    from telethon.sessions import StringSession
+
+    area_data: dict[str, dict[str, list[dict[str, str]]]] = {lbl: {} for lbl, _ in ASSURANCE_AREA_GROUPS}
+    area_found: list[str] = []
+    seen_global_inc: set[str] = set()
+
+    client = TelegramClient(StringSession(session_str), int(api_id_raw), api_hash)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            msg = f"LIST CLOSING TIKET ASSURANCE {dt_disp}\n\n⚠️ TG_STRING_SESSION tidak valid."
+            return {"text": msg, "summary_text": msg, "total_closed": 0, "areas_found": []}
+
+        target_dialogs: dict[str, Any] = {}
+        async for dlg in client.iter_dialogs(limit=200):
+            area_lbl = _match_assurance_area(getattr(dlg, "name", "") or "")
+            if area_lbl and area_lbl not in target_dialogs:
+                target_dialogs[area_lbl] = dlg
+
+        for area_lbl, _ in ASSURANCE_AREA_GROUPS:
+            dlg = target_dialogs.get(area_lbl)
+            if not dlg:
+                continue
+            area_found.append(area_lbl)
+            msgs = await client.get_messages(dlg.entity, limit=40)
+            latest_by_header: dict[str, str] = {}
+            for msg in msgs:
+                msg_dt = getattr(msg, "date", None)
+                txt = getattr(msg, "message", "") or ""
+                if not msg_dt or not txt:
+                    continue
+                if msg_dt.tzinfo is None:
+                    msg_dt = msg_dt.replace(tzinfo=dt_timezone.utc)
+                if msg_dt.astimezone(tz).strftime("%Y-%m-%d") != dkey:
+                    continue
+                upper_txt = txt.upper()
+                if "CLOSED HARI INI" not in upper_txt and "TOTAL CLOSED" not in upper_txt:
+                    continue
+                first_line = txt.splitlines()[0].strip().upper()
+                # Ambil pesan terbaru untuk tiap unit/header (misal A6NNK1, A6NNK5, dst.)
+                if first_line not in latest_by_header:
+                    latest_by_header[first_line] = txt
+
+            area_seen_inc: set[str] = set()
+            for raw_txt in latest_by_header.values():
+                parsed = parse_assurance_closed_message(raw_txt)
+                for cat_key, items in parsed["categories"].items():
+                    for item in items:
+                        if item["inc"] in area_seen_inc:
+                            continue
+                        area_seen_inc.add(item["inc"])
+                        area_data[area_lbl].setdefault(cat_key, []).append(item)
+    except Exception as exc:
+        logger.warning("Gagal mengambil List Closing Assurance: %s", exc)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+    # Susun format Ringkasan (selalu padat & rapi) dan format Rincian (seperti SS kedua)
+    grand_cats: dict[str, list[dict[str, str]]] = {}
+    summary_blocks: list[str] = [f"📊 LIST CLOSING TIKET ASSURANCE\nTanggal: {dt_disp} (Update {time_disp})"]
+    detail_blocks: list[str] = [f"📋 RINCIAN CLOSING TIKET ASSURANCE\nTanggal: {dt_disp} (Update {time_disp})"]
+
+    for area_lbl, _ in ASSURANCE_AREA_GROUPS:
+        cats = area_data.get(area_lbl, {})
+        area_tickets = [t for lst in cats.values() for t in lst]
+        s_lines = [f"▸ {area_lbl} ({len(area_tickets)} Closed)"]
+        d_lines = [f"═══ {area_lbl} ({len(area_tickets)}) ═══"]
+        if not cats:
+            status_note = "  (Belum ada closing hari ini)" if area_lbl in area_found else "  (Grup belum ditemukan di akun Telegram)"
+            s_lines.append(status_note)
+            d_lines.append(status_note)
+        else:
+            for cat_key, items in cats.items():
+                in_cnt = sum(1 for x in items if x["sla"] == "in")
+                out_cnt = sum(1 for x in items if x["sla"] == "out")
+                sla_str = f" (👍{in_cnt} 👎{out_cnt})" if (in_cnt or out_cnt) else ""
+                s_lines.append(f"  • {cat_key}: {len(items)}{sla_str}")
+
+                d_lines.append(f"• {cat_key}")
+                for idx, it in enumerate(items, start=1):
+                    sla_icon = " | 👍" if it["sla"] == "in" else (" | 👎" if it["sla"] == "out" else "")
+                    row = f"  {idx}. {it['inc']} | {it['inet']} | {it['open']} | {it['close']}{sla_icon}"
+                    d_lines.append(row)
+                    if it["odp"]:
+                        d_lines.append(f"     {it['odp']}")
+
+                for it in items:
+                    if it["inc"] not in seen_global_inc:
+                        seen_global_inc.add(it["inc"])
+                        grand_cats.setdefault(cat_key, []).append(it)
+
+        summary_blocks.append("\n".join(s_lines))
+        detail_blocks.append("\n".join(d_lines))
+
+    # Grand total gabungan (unik per INC agar NNK04 tidak terhitung ganda jika masuk 2 grup)
+    grand_total = len(seen_global_inc)
+    total_in = sum(1 for lst in grand_cats.values() for x in lst if x["sla"] == "in")
+    total_out = sum(1 for lst in grand_cats.values() for x in lst if x["sla"] == "out")
+    gt_lines = ["━━━━━━━━━━━━━━━━━━━━", "📌 REKAP GABUNGAN HARI INI"]
+    for cat_key, items in grand_cats.items():
+        ic = sum(1 for x in items if x["sla"] == "in")
+        oc = sum(1 for x in items if x["sla"] == "out")
+        ss = f" (👍{ic} 👎{oc})" if (ic or oc) else ""
+        gt_lines.append(f"• {cat_key}: {len(items)}{ss}")
+    gt_sla = f" (👍 {total_in} | 👎 {total_out})" if (total_in or total_out) else ""
+    gt_lines.append(f"TOTAL CLOSED HARI INI : {grand_total}{gt_sla}")
+    gt_block = "\n".join(gt_lines)
+
+    summary_blocks.append(gt_block)
+    detail_blocks.append(gt_block)
+    summary_text = "\n\n".join(summary_blocks)
+    detail_text = "\n\n".join(detail_blocks)
+    return {
+        "text": detail_text if detail else summary_text,
+        "summary_text": summary_text,
+        "detail_text": detail_text,
+        "total_closed": grand_total,
+        "areas_found": area_found,
+    }
+
+
+async def cmd_listclosing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ambil & tampilkan List Closing Tiket Assurance hari ini dari 3 grup Area."""
+    if not update.message or not update.effective_chat:
+        return
+    config: BotConfig = context.bot_data["config"]
+    if not is_admin(update, config, context.bot_data):
+        await deny_access(update)
+        return
+    wait_msg = await update.message.reply_html("⏳ Mengambil List Closing Tiket dari 3 grup Assurance...")
+    rep = await fetch_assurance_closing_report(config.tzinfo, detail=False)
+    await wait_msg.edit_text(
+        f"<pre>{html.escape(rep['summary_text'])}</pre>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔄 Refresh", callback_data="assur:closing"),
+                    InlineKeyboardButton("📄 Rincian INC", callback_data="assur:closing:detail"),
+                ],
+                [InlineKeyboardButton("📤 Kirim ke Chat Ini", callback_data="assur:closing:send")],
+            ]
+        ),
+    )
+
+
 # ==================== LIFECYCLE & CLI ====================
 
 
@@ -5896,6 +6235,7 @@ def main() -> None:
     application.add_handler(CommandHandler("otp", cmd_otp))
     application.add_handler(CommandHandler(["wo", "ao", "sc"], cmd_wo))
     application.add_handler(CommandHandler("listpsb", cmd_listpsb))
+    application.add_handler(CommandHandler("listclosing", cmd_listclosing))
     application.add_handler(CallbackQueryHandler(handle_menu_callback))
 
     logger.info("Menjalankan Telegram AutoSender Bot...")
