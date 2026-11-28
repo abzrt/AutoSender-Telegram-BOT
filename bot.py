@@ -6043,6 +6043,9 @@ async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
             BotCommand("menu", "Buka menu utama interaktif"),
+            BotCommand("wo", "Ambil SS HD Workorder (WONUM / No AO / No SC)"),
+            BotCommand("listpsb", "Lihat List PSB Harian Provisioning"),
+            BotCommand("listclosing", "Lihat List Closing Tiket Assurance"),
             BotCommand("targets", "Kelola ID Grup/User/Channel"),
             BotCommand("presets", "Kelola preset tim/shift tag"),
             BotCommand("history", "Lihat riwayat pengiriman"),
