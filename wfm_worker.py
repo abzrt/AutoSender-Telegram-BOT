@@ -377,14 +377,42 @@ class WfmFlowWorker:
         except Exception:
             pass
 
-        # 2. Buka halaman /workorder, pakai Filter (Track ID / SC Order No) & baca baris tabel
+        # 2. Cari URL daftar Workorder dari localStorage.menus (antisipasi case-sensitive seperti /Workorder)
+        wo_list_url = f"{FLOW_BASE_URL}/workorder"
+        try:
+            menu_info = await page.evaluate(
+                """() => {
+                    const raw = localStorage.getItem('menus') || '';
+                    const matches = raw.match(/\/[a-zA-Z0-9_/-]*workorder[a-zA-Z0-9_/-]*/gi) || [];
+                    const links = Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.getAttribute('href') || '')
+                        .filter(h => /workorder/i.test(h) && !/editworkorder/i.test(h));
+                    const scripts = Array.from(document.querySelectorAll('script[src]'))
+                        .map(s => s.getAttribute('src') || '')
+                        .filter(s => /search|global|workorder/i.test(s));
+                    return {matches: matches.slice(0, 10), links: links.slice(0, 10), scripts: scripts.slice(0, 10)};
+                }"""
+            )
+            logger.info("[WFM] Menu discovery: %s", menu_info)
+            cands = [u for u in (menu_info.get("links") or []) + (menu_info.get("matches") or []) if "edit" not in u.lower()]
+            if cands:
+                u0 = cands[0]
+                wo_list_url = u0 if u0.startswith("http") else f"{FLOW_BASE_URL}{u0 if u0.startswith('/') else '/' + u0}"
+        except Exception as exc:
+            logger.warning("[WFM] Menu discovery err: %s", exc)
+
         await page.goto(
-            f"{FLOW_BASE_URL}/workorder",
+            wo_list_url,
             wait_until="domcontentloaded",
             referer=f"{FLOW_BASE_URL}/home",
             timeout=30000,
         )
-        await asyncio.sleep(1.2)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+        logger.info("[WFM] Opened WO list URL=%s -> actual=%s", wo_list_url, page.url)
 
         # Buka panel/modal filter SEKALI saja (jangan toggle buka-tutup), lalu isi Track ID / SC Order No
         for step in range(3):
@@ -467,9 +495,12 @@ class WfmFlowWorker:
                         dtSearch.dispatchEvent(new Event('change', {bubbles: true}));
                         return {status: 'APPLIED_DT_SEARCH'};
                     }
-                    const dbg = Array.from(document.querySelectorAll('input')).filter(isVisible).slice(0, 15)
-                        .map(i => `${i.id}|${i.name}|${i.placeholder}`);
-                    return {status: 'NO_INPUT', inputs: dbg};
+                    const dbg = Array.from(document.querySelectorAll('input, select')).slice(0, 25)
+                        .map(i => `${i.tagName}:${i.id}|${i.name}|${i.placeholder || ''}|vis=${isVisible(i)}`);
+                    const btnsDbg = Array.from(document.querySelectorAll('button, a')).filter(isVisible)
+                        .map(b => (b.innerText || b.title || '').trim())
+                        .filter(t => t && t.length < 30).slice(0, 20);
+                    return {status: 'NO_INPUT', inputs: dbg, btns: btnsDbg};
                 }""",
                 {"targetSc": q_clean, "allowOpen": step == 0},
             )
