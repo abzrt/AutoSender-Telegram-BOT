@@ -5683,8 +5683,8 @@ async def fetch_assurance_closing_report(tz: Any, detail: bool = False) -> dict[
             if not dlg:
                 continue
             area_found.append(area_lbl)
-            msgs = await client.get_messages(dlg.entity, limit=40)
-            latest_by_header: dict[str, str] = {}
+            msgs = await client.get_messages(dlg.entity, limit=120)
+            latest_by_unit: dict[str, tuple[str, str]] = {}
             for msg in msgs:
                 msg_dt = getattr(msg, "date", None)
                 txt = getattr(msg, "message", "") or ""
@@ -5692,19 +5692,31 @@ async def fetch_assurance_closing_report(tz: Any, detail: bool = False) -> dict[
                     continue
                 if msg_dt.tzinfo is None:
                     msg_dt = msg_dt.replace(tzinfo=dt_timezone.utc)
-                if msg_dt.astimezone(tz).strftime("%Y-%m-%d") != dkey:
+                local_dt = msg_dt.astimezone(tz)
+                if local_dt.strftime("%Y-%m-%d") != dkey:
                     continue
                 upper_txt = txt.upper()
-                if "CLOSED HARI INI" not in upper_txt and "TOTAL CLOSED" not in upper_txt:
+                if "TOTAL CLOSED HARI INI" not in upper_txt and not ("LIST WO" in upper_txt and "CLOSED" in upper_txt):
                     continue
                 first_line = txt.splitlines()[0].strip().upper()
-                # Ambil pesan terbaru untuk tiap unit/header (misal A6NNK1, A6NNK5, dst.)
-                if first_line not in latest_by_header:
-                    latest_by_header[first_line] = txt
+                unit_m = re.search(r"\b(A\d[A-Z]{2,5}\d?)\b", first_line)
+                unit_key = unit_m.group(1) if unit_m else re.sub(r"\d{1,2}[:/.]\d{2}.*", "", first_line).strip()
+                # Pesan diiterasi dari terbaru ke terlama -> ambil 1 snapshot TERBARU saja per unit!
+                if unit_key not in latest_by_unit:
+                    latest_by_unit[unit_key] = (local_dt.strftime("%H:%M"), txt)
 
+            logger.info("[ASSUR] %s -> units=%s", area_lbl, {k: v[0] for k, v in latest_by_unit.items()})
             area_seen_inc: set[str] = set()
-            for raw_txt in latest_by_header.values():
+            for unit_key, (_ts, raw_txt) in latest_by_unit.items():
                 parsed = parse_assurance_closed_message(raw_txt)
+                logger.info(
+                    "[ASSUR] %s/%s reported=%s parsed=%d cats=%s",
+                    area_lbl,
+                    unit_key,
+                    parsed["reported_total"],
+                    len(parsed["tickets"]),
+                    {ck: len(cv) for ck, cv in parsed["categories"].items()},
+                )
                 for cat_key, items in parsed["categories"].items():
                     for item in items:
                         if item["inc"] in area_seen_inc:
