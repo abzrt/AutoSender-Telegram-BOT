@@ -4357,7 +4357,13 @@ async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             }
             if thread_id is not None:
                 send_kwargs["message_thread_id"] = thread_id
-            await context.bot.send_message(**send_kwargs)
+            sent_test = await context.bot.send_message(**send_kwargs)
+            await replace_previous_wo_messages(
+                context.bot,
+                config.schedules_file.parent,
+                f"ADING_TEST:{chat.id}",
+                [{"chat_id": chat.id, "message_id": sent_test.message_id}],
+            )
         return
 
     if data == "menu:assurance":

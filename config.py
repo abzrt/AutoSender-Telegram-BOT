@@ -228,7 +228,7 @@ class ScheduleJob:
     photo: str | None = None
     document: str | None = None
     thread_id: int | None = None
-    auto_delete_prev: bool = False
+    auto_delete_prev: bool = True
     require_ack: bool = False
     mentions: list[str] = field(default_factory=list)
     # Jam operasional opsional (contoh: active_hours="08:00-17:00", active_days=[1,2,3,4,5])
@@ -309,8 +309,7 @@ class ScheduleJob:
             data["document"] = self.document
         if self.thread_id is not None:
             data["thread_id"] = self.thread_id
-        if self.auto_delete_prev:
-            data["auto_delete_prev"] = True
+        data["auto_delete_prev"] = self.auto_delete_prev
         if self.require_ack:
             data["require_ack"] = True
         if self.mentions:
@@ -430,7 +429,7 @@ def load_schedules(path: str | Path) -> list[ScheduleJob]:
             photo=item.get("photo"),
             document=item.get("document"),
             thread_id=int(item["thread_id"]) if item.get("thread_id") is not None else None,
-            auto_delete_prev=bool(item.get("auto_delete_prev", False)),
+            auto_delete_prev=bool(item.get("auto_delete_prev", True)),
             require_ack=bool(item.get("require_ack", False)),
             mentions=list(item.get("mentions", [])),
             active_hours=item.get("active_hours"),
